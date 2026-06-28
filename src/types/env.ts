@@ -25,7 +25,8 @@ export interface Env {
   RATE_LIMIT: DurableObjectNamespace;
 
   // Environment variables
-  SERVER_NAME: string;
+  SERVER_NAME: string;       // Matrix identity domain, e.g. "wlix13.dev" (used in user IDs)
+  WORKER_DOMAIN?: string;    // Actual API domain, e.g. "m.wlix13.dev" (used in well-known URLs); defaults to SERVER_NAME
   SERVER_VERSION: string;
 
   // Support contact info (optional)
@@ -52,8 +53,8 @@ export interface Env {
   // Durable Object for call signaling
   CALL_ROOMS?: DurableObjectNamespace;
 
-  // Workers VPC Service binding for LiveKit
-  LIVEKIT_API: Fetcher;
+  // Workers VPC Service binding for LiveKit (optional - only when vpc_services is configured)
+  LIVEKIT_API?: Fetcher;
 
   // LiveKit Configuration for MatrixRTC
   LIVEKIT_API_KEY?: string;      // LiveKit API Key (e.g., "devkey")

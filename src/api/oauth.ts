@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
-import { hashToken, verifyPassword } from '../utils/crypto';
+import { hashToken, verifyPassword, timingSafeEqual } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
 import { createDevice, createAccessToken, getUserById } from '../services/database';
 
@@ -373,7 +373,7 @@ app.post('/oauth/token', async (c) => {
       return c.json({ error: 'invalid_client', error_description: 'client_secret is required' }, 401);
     }
     const secretHash = await hashClientSecret(effectiveClientSecret);
-    if (secretHash !== client.client_secret_hash) {
+    if (!timingSafeEqual(secretHash, client.client_secret_hash)) {
       return c.json({ error: 'invalid_client', error_description: 'Invalid client credentials' }, 401);
     }
   }

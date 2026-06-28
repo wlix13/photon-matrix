@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
-import { hashPassword, verifyPassword, hashToken } from '../utils/crypto';
+import { hashPassword, verifyPassword, hashToken, MIN_PASSWORD_LENGTH } from '../utils/crypto';
 import {
   formatUserId,
   generateDeviceId,
@@ -36,11 +36,13 @@ app.get('/_matrix/client/v3/login', (c) => {
       {
         type: 'm.login.token',
       },
-      {
-        type: 'm.login.dummy',
-      },
     ],
   });
+});
+
+// GET /_matrix/client/v3/password_policy - Password requirements clients should enforce
+app.get('/_matrix/client/v3/password_policy', (c) => {
+  return c.json({ 'm.minimum_length': MIN_PASSWORD_LENGTH });
 });
 
 // POST /_matrix/client/v3/login - Login
@@ -107,23 +109,6 @@ app.post('/_matrix/client/v3/login', async (c) => {
     const valid = await verifyPassword(password, storedHash);
     if (!valid) {
       return Errors.forbidden('Invalid username or password').toResponse();
-    }
-  } else if (type === 'm.login.dummy') {
-    // m.login.dummy is for UIA flows - requires identifier but no password verification
-    // Per Matrix spec, this "does nothing and never fails" but still needs a user identifier
-    if (!identifier) {
-      return Errors.missingParam('identifier').toResponse();
-    }
-
-    // Parse identifier
-    if (identifier.type === 'm.id.user') {
-      if (identifier.user.startsWith('@')) {
-        userId = identifier.user;
-      } else {
-        userId = formatUserId(identifier.user, c.env.SERVER_NAME);
-      }
-    } else {
-      return Errors.unrecognized('Unknown identifier type').toResponse();
     }
   } else {
     return Errors.unrecognized('Unknown login type').toResponse();
@@ -305,6 +290,20 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   const isGuest = kind === 'guest';
 
+  // Enforce the admin-controlled registration toggle before doing anything else
+  try {
+    const adminId = c.env.ADMIN.idFromName('global');
+    const adminDO = c.env.ADMIN.get(adminId);
+    const configRes = await adminDO.fetch('http://internal/config');
+    const config = await configRes.json() as { registration_enabled: boolean };
+    if (!config.registration_enabled) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'Registration is disabled on this server' }, 403);
+    }
+  } catch {
+    // If the DO is unavailable, fail closed (deny registration)
+    return c.json({ errcode: 'M_UNKNOWN', error: 'Unable to verify registration status' }, 503);
+  }
+
   // For non-guests, require username and password
   if (!isGuest) {
     // Registration UIA is a single m.login.dummy stage
@@ -327,6 +326,10 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
     if (!password) {
       return Errors.missingParam('password').toResponse();
+    }
+
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return Errors.passwordTooShort(MIN_PASSWORD_LENGTH).toResponse();
     }
   }
 

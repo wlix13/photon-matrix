@@ -8,7 +8,8 @@ const app = new Hono<AppEnv>();
 // GET /.well-known/matrix/client
 app.get('/.well-known/matrix/client', (c) => {
   const serverName = c.env.SERVER_NAME;
-  const baseUrl = `https://${serverName}`;
+  const apiDomain = c.env.WORKER_DOMAIN || serverName;
+  const baseUrl = `https://${apiDomain}`;
 
   const response: Record<string, unknown> = {
     'm.homeserver': {
@@ -35,9 +36,9 @@ app.get('/.well-known/matrix/client', (c) => {
 
 // GET /.well-known/matrix/server
 app.get('/.well-known/matrix/server', (c) => {
-  const serverName = c.env.SERVER_NAME;
+  const apiDomain = c.env.WORKER_DOMAIN || c.env.SERVER_NAME;
   return c.json({
-    'm.server': `${serverName}:443`,
+    'm.server': `${apiDomain}:443`,
   });
 });
 

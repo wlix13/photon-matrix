@@ -410,6 +410,12 @@ export async function verifyRemoteSignature(
     return false;
   }
 
+  // Reject keys whose self-signature was never verified - they may be spoofed.
+  if (!key.verified) {
+    console.warn(`Key ${serverName}:${keyId} failed self-signature verification during fetch; rejecting`);
+    return false;
+  }
+
   // Check key validity
   if (key.valid_until && key.valid_until < Date.now()) {
     console.warn(`Key ${serverName}:${keyId} has expired`);

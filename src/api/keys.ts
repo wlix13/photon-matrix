@@ -955,26 +955,44 @@ app.get('/_matrix/client/v3/auth/m.login.sso/callback', async (c) => {
 
   const session = JSON.parse(sessionJson);
 
-  // If code is present, SSO was successful
-  // For UIA purposes, we just need to verify the user authenticated - we don't need the token
-  if (code) {
-    // Mark SSO as completed in the session
-    session.completed_stages = session.completed_stages || [];
-    if (!session.completed_stages.includes('m.login.sso')) {
-      session.completed_stages.push('m.login.sso');
-    }
-    session.sso_completed_at = Date.now();
-
-    // Save updated session
-    await c.env.CACHE.put(`uia_session:${state}`, JSON.stringify(session), { expirationTtl: 300 });
-
-    console.log('[keys/sso] SSO completed for UIA session:', state);
-
-    // Return success page that tells the client to retry the original request
-    return c.html(generateSSOSuccessPage(state, session.redirect_url));
+  if (!code) {
+    return c.html(generateSSOErrorPage('Authentication Failed', 'No authorization code received'));
   }
 
-  return c.html(generateSSOErrorPage('Authentication Failed', 'No authorization code received'));
+  // The code must be one our own /oauth/authorize issued (stored as oauth_code:<code>),
+  // so knowing the session ID alone is not enough to complete this flow.
+  const authCodeJson = await c.env.SESSIONS.get(`oauth_code:${code}`);
+  if (!authCodeJson) {
+    console.warn('[keys/sso] Invalid or already-used authorization code for UIA session:', state);
+    return c.html(generateSSOErrorPage('Authentication Failed', 'Invalid or expired authorization code'));
+  }
+
+  let authCode: { user_id: string; client_id: string; redirect_uri: string };
+  try {
+    authCode = JSON.parse(authCodeJson);
+  } catch {
+    return c.html(generateSSOErrorPage('Authentication Failed', 'Malformed authorization code'));
+  }
+
+  // Verify the code was issued for the same user as the UIA session
+  if (authCode.user_id !== session.user_id) {
+    console.warn('[keys/sso] Authorization code user mismatch for UIA session:', state);
+    return c.html(generateSSOErrorPage('Authentication Failed', 'Authorization code does not match session user'));
+  }
+
+  await c.env.SESSIONS.delete(`oauth_code:${code}`);
+
+  session.completed_stages = session.completed_stages || [];
+  if (!session.completed_stages.includes('m.login.sso')) {
+    session.completed_stages.push('m.login.sso');
+  }
+  session.sso_completed_at = Date.now();
+
+  await c.env.CACHE.put(`uia_session:${state}`, JSON.stringify(session), { expirationTtl: 300 });
+
+  console.log('[keys/sso] SSO completed for UIA session:', state);
+
+  return c.html(generateSSOSuccessPage(state, session.redirect_url));
 });
 
 // POST /_matrix/client/v3/auth/m.login.token/submit - Submit token for UIA
@@ -1076,9 +1094,9 @@ function generateSSOSuccessPage(sessionId: string, _redirectUrl?: string): strin
     <p>You can now return to your Matrix client and complete the operation.</p>
     <p class="session">Session: ${sessionId}</p>
     <script>
-      // Try to notify the parent window/opener if this was opened as a popup
+      // Notify the opener only if it shares our origin
       if (window.opener) {
-        window.opener.postMessage({ type: 'uia_complete', session: '${sessionId}' }, '*');
+        window.opener.postMessage({ type: 'uia_complete', session: '${sessionId}' }, window.location.origin);
         setTimeout(() => window.close(), 2000);
       }
     </script>

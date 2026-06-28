@@ -5,6 +5,22 @@ import { base64UrlEncode, base64UrlDecode } from './ids';
 // Re-export for convenience
 export { base64UrlEncode, base64UrlDecode };
 
+// Shortest password accepted at registration and password change
+export const MIN_PASSWORD_LENGTH = 8;
+
+// Compare two strings in constant time so a mismatch position can't be timed
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const encoder = new TextEncoder();
+  const x = encoder.encode(a);
+  const y = encoder.encode(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) {
+    diff |= x[i] ^ y[i];
+  }
+  return diff === 0;
+}
+
 // Hash a password using PBKDF2 (Web Crypto compatible alternative to Argon2)
 export async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder();
@@ -67,7 +83,8 @@ export async function verifyPassword(password: string, storedHash: string): Prom
   );
 
   const hashB64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
-  return hashB64 === expectedHash;
+
+  return timingSafeEqual(hashB64, expectedHash);
 }
 
 // SHA-256 digest as unpadded URL-safe base64

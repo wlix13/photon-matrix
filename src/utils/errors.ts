@@ -119,6 +119,14 @@ export const Errors = {
   tooLarge(message: string = 'Request too large'): MatrixApiError {
     return new MatrixApiError(ErrorCodes.M_TOO_LARGE, message, 413);
   },
+
+  passwordTooShort(minLength: number): MatrixApiError {
+    return new MatrixApiError(
+      ErrorCodes.M_PASSWORD_TOO_SHORT,
+      `Password must be at least ${minLength} characters long`,
+      400
+    );
+  },
 };
 
 // Wrap an async handler with error handling

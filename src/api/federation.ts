@@ -53,32 +53,29 @@ app.get('/_matrix/key/v2/server', async (c) => {
     valid_until: number | null;
   }>();
 
-  // Check if we need to generate a new secure key
   const hasSecureKey = keys.results.some((k) => k.key_version === 2 && k.private_key_jwk);
 
   if (keys.results.length === 0 || !hasSecureKey) {
-    // Generate new secure signing key with proper Ed25519
     const keyPair = await generateSigningKeyPair();
     const validFrom = Date.now();
     const validUntil = validFrom + 365 * 24 * 60 * 60 * 1000; // 1 year
 
-    // Mark old keys as not current
-    await c.env.DB.prepare(`UPDATE server_keys SET is_current = 0`).run();
-
-    // Insert new secure key
-    await c.env.DB.prepare(
-      `INSERT INTO server_keys (key_id, public_key, private_key, private_key_jwk, key_version, valid_from, valid_until, is_current)
-       VALUES (?, ?, ?, ?, 2, ?, ?, 1)`
-    )
-      .bind(
+    // INSERT OR IGNORE so that if two Workers race here only one key wins;
+    // otherwise both could survive as is_current = 1.
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE server_keys SET is_current = 0 WHERE key_version = 2`),
+      c.env.DB.prepare(
+        `INSERT OR IGNORE INTO server_keys (key_id, public_key, private_key, private_key_jwk, key_version, valid_from, valid_until, is_current)
+         VALUES (?, ?, ?, ?, 2, ?, ?, 1)`
+      ).bind(
         keyPair.keyId,
         keyPair.publicKey,
-        JSON.stringify(keyPair.privateKeyJwk), // Store JWK as string in legacy column too
+        JSON.stringify(keyPair.privateKeyJwk),
         JSON.stringify(keyPair.privateKeyJwk),
         validFrom,
         validUntil
-      )
-      .run();
+      ),
+    ]);
 
     keys = {
       results: [
@@ -145,7 +142,7 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
     return Errors.notFound('Key not found').toResponse();
   }
 
-  const response = {
+  const response: Record<string, unknown> = {
     server_name: serverName,
     valid_until_ts: key.valid_until || (Date.now() + 365 * 24 * 60 * 60 * 1000),
     verify_keys: {
@@ -153,6 +150,13 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
     },
     old_verify_keys: {},
   };
+
+  // Signed per spec, like the main key endpoint
+  const signingKey = await getNotarySigningKey(c.env.DB);
+  if (signingKey) {
+    const signed = await signJson(response, serverName, signingKey.keyId, signingKey.privateKeyJwk);
+    return c.json(signed);
+  }
 
   return c.json(response);
 });
