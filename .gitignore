@@ -10,6 +10,9 @@ dist/
 .env.local
 .dev.vars
 
+# Local wrangler config (real account / resource IDs)
+wrangler.local.jsonc
+
 # IDE
 .idea/
 .vscode/

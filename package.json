@@ -1,11 +1,11 @@
 {
-  "name": "matrix-worker",
+  "name": "photon-matrix",
   "version": "0.1.0",
   "description": "Matrix homeserver running on Cloudflare Workers",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "wrangler dev -c wrangler.local.jsonc",
+    "deploy": "wrangler deploy -c wrangler.local.jsonc",
     "db:migrate": "wrangler d1 execute tuwunel-db --file=./migrations/schema.sql",
     "db:migrate:local": "wrangler d1 execute tuwunel-db --local --file=./migrations/schema.sql",
     "test": "vitest",
@@ -13,14 +13,12 @@
     "lint": "eslint src/"
   },
   "dependencies": {
-    "@cloudflare/workers-types": "^4.20241127.0",
-    "hono": "^4.6.0",
-    "uuid": "^10.0.0"
+    "@cloudflare/workers-types": "^5.20260721.1",
+    "hono": "^4.12.25"
   },
   "devDependencies": {
-    "@types/uuid": "^10.0.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0",
-    "wrangler": "^4.61.0"
+    "vitest": "^3.2.6",
+    "wrangler": "^4.112.0"
   }
 }

@@ -1,6 +1,8 @@
 {
+  // Template: the IDs below are placeholders. Copy to wrangler.local.jsonc (gitignored)
+  // and fill in your own resources - npm run dev / deploy read that file.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "matrix-worker",
+  "name": "photon-matrix",
   "main": "src/index.ts",
   "compatibility_date": "2024-11-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -93,6 +95,7 @@
     ]
   },
 
+  // All Durable Objects use SQLite-backed storage (required for new accounts)
   "migrations": [
     {
       "tag": "v1",
@@ -100,27 +103,29 @@
     },
     {
       "tag": "v2",
-      "new_classes": ["CallRoomDurableObject"]
+      "new_sqlite_classes": ["CallRoomDurableObject"]
     },
     {
       "tag": "v3",
-      "new_classes": ["AdminDurableObject"]
+      "new_sqlite_classes": ["AdminDurableObject"]
     },
     {
       "tag": "v4",
-      "new_classes": ["UserKeysDurableObject"]
+      "new_sqlite_classes": ["UserKeysDurableObject"]
     },
     {
       "tag": "v5",
-      "new_classes": ["PushDurableObject"]
+      "new_sqlite_classes": ["PushDurableObject"]
     },
     {
       "tag": "v6",
-      "new_classes": ["RateLimitDurableObject"]
+      "new_sqlite_classes": ["RateLimitDurableObject"]
     }
   ],
 
   // Environment variables
+  // Optional "WORKER_DOMAIN": the host serving the API when SERVER_NAME is an apex domain
+  // delegated via /.well-known/matrix/*. Client-facing URLs fall back to SERVER_NAME.
   "vars": {
     "SERVER_NAME": "m.easydemo.org",
     "SERVER_VERSION": "0.1.0",
@@ -150,7 +155,8 @@
   // 3. Copy the App ID and App Secret
   // Or use the API: https://developers.cloudflare.com/api/resources/calls/subresources/sfu/methods/create/
 
-  // Custom domain routing
+  // Custom domain routing. To delegate from an apex domain, add a second route:
+  //   { "pattern": "example.org/.well-known/matrix/*", "zone_name": "example.org" }
   "routes": [
     {
       "pattern": "m.easydemo.org",

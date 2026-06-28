@@ -49,7 +49,7 @@ The `SERVER_NAME` environment variable must match your domain. Update it in your
 
 1. Go to [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages)
 2. Select your deployed Worker
-3. Go to **Settings** → **Variables and Secrets**
+3. Go to **Settings** -> **Variables and Secrets**
 4. Edit `SERVER_NAME` to your domain (e.g., `matrix.yourdomain.com`)
 5. Click **Deploy** to apply changes
 
@@ -88,8 +88,8 @@ npx wrangler d1 execute YOUR_DB_NAME --remote --file=migrations/008_federation_t
 Your Worker is deployed at `*.workers.dev` but Matrix federation requires a proper domain:
 
 1. Go to your Worker in the dashboard
-2. Navigate to **Settings** → **Domains & Routes**
-3. Click **Add** → **Custom Domain**
+2. Navigate to **Settings** -> **Domains & Routes**
+3. Click **Add** -> **Custom Domain**
 4. Enter your domain (e.g., `matrix.yourdomain.com`)
 5. Cloudflare automatically configures DNS if your domain is on Cloudflare
 
@@ -227,7 +227,11 @@ npx wrangler r2 bucket create my-matrix-media
 
 ## Step 3: Configure wrangler.jsonc
 
-Open `wrangler.jsonc` and replace all placeholder values with your actual IDs.
+`wrangler.jsonc` is a tracked template with placeholder IDs. Copy it to `wrangler.local.jsonc` (gitignored) and replace all placeholder values with your actual IDs - `npm run dev` and `npm run deploy` read that file:
+
+```bash
+cp wrangler.jsonc wrangler.local.jsonc
+```
 
 ### 3.1 Basic Configuration
 
@@ -358,8 +362,8 @@ The output will show your worker URL (e.g., `my-matrix-server.your-subdomain.wor
 ### Option A: Cloudflare Custom Domain (Recommended)
 
 1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. Navigate to **Workers & Pages** → Your Worker → **Settings** → **Domains & Routes**
-3. Click **Add** → **Custom Domain**
+2. Navigate to **Workers & Pages** -> Your Worker -> **Settings** -> **Domains & Routes**
+3. Click **Add** -> **Custom Domain**
 4. Enter your domain (e.g., `matrix.yourdomain.com`)
 5. Cloudflare automatically configures DNS
 
@@ -433,7 +437,7 @@ curl -X POST "$MATRIX_SERVER/_matrix/client/v3/register" \
 ### 7.4 Test with Element
 
 1. Open [Element Web](https://app.element.io)
-2. Click **Sign In** → **Edit** homeserver
+2. Click **Sign In** -> **Edit** homeserver
 3. Enter your server URL: `https://matrix.yourdomain.com`
 4. Sign in with your registered user
 
@@ -445,7 +449,7 @@ curl -X POST "$MATRIX_SERVER/_matrix/client/v3/register" \
 
 Cloudflare provides TURN servers. To enable:
 
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com) → **Calls** → **TURN**
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com) -> **Calls** -> **TURN**
 2. Create a TURN key
 3. Add to `wrangler.jsonc`:
    ```jsonc
@@ -501,7 +505,7 @@ npx wrangler secret put OIDC_ENCRYPTION_KEY
 ### "Workers Paid plan required"
 
 Durable Objects require the Workers Paid plan ($5/month). Upgrade at:
-Cloudflare Dashboard → Workers & Pages → Plans
+Cloudflare Dashboard -> Workers & Pages -> Plans
 
 ### "Database not found"
 
