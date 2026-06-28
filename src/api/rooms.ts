@@ -955,6 +955,13 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   const eventType = c.req.param('eventType');
   const txnId = c.req.param('txnId');
 
+  const existingTxn = await c.env.DB.prepare(
+    `SELECT response FROM transaction_ids WHERE user_id = ? AND txn_id = ?`
+  ).bind(userId, txnId).first<{ response: string }>();
+  if (existingTxn) {
+    return c.json(JSON.parse(existingTxn.response));
+  }
+
   // Check membership
   const membership = await getMembership(c.env.DB, roomId, userId);
   if (!membership || membership.membership !== 'join') {
@@ -996,27 +1003,34 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
 
   await storeEvent(c.env.DB, event);
 
-  // Notify all room members that a new message was sent (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
+  // Store txnId for idempotency (best-effort)
+  const responseBody = JSON.stringify({ event_id: eventId });
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare(
+      `INSERT INTO transaction_ids (user_id, txn_id, response) VALUES (?, ?, ?)
+       ON CONFLICT (user_id, txn_id) DO NOTHING`
+    ).bind(userId, txnId, responseBody).run().catch(() => {})
+  );
 
-  // Send push notifications via durable workflow (fire and forget)
-  // Only for message and encrypted event types
-  if (eventType === 'm.room.message' || eventType === 'm.room.encrypted') {
-    c.executionCtx.waitUntil(
-      c.env.PUSH_NOTIFICATION_WORKFLOW.create({
-        params: {
-          eventId,
-          roomId,
-          eventType,
-          sender: userId,
-          content,
-          originServerTs: event.origin_server_ts,
-        },
-      }).catch(err => {
-        console.error('[rooms] Push notification workflow error:', err);
-      })
-    );
-  }
+  // Fire-and-forget: notify SyncDOs and push after returning the response
+  c.executionCtx.waitUntil(
+    notifyUsersOfEvent(c.env, roomId, eventId, eventType).then(async () => {
+      if (eventType === 'm.room.message' || eventType === 'm.room.encrypted') {
+        await c.env.PUSH_NOTIFICATION_WORKFLOW.create({
+          params: {
+            eventId,
+            roomId,
+            eventType,
+            sender: userId,
+            content,
+            originServerTs: event.origin_server_ts,
+          },
+        }).catch(err => {
+          console.error('[rooms] Push notification workflow error:', err);
+        });
+      }
+    })
+  );
 
   return c.json({ event_id: eventId });
 });
