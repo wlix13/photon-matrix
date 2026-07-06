@@ -420,8 +420,10 @@ Device ID: ${deviceId}\`;
 // GET /_matrix/client/v1/auth_metadata - Supported authentication methods
 // Stable MSC2965 endpoint as of Matrix v1.17
 app.get('/_matrix/client/v1/auth_metadata', async (c) => {
-  const serverName = c.env.SERVER_NAME;
-  const baseUrl = `https://${serverName}`;
+  // OAuth endpoints are served by the Worker, which is only routed on the API
+  // domain (WORKER_DOMAIN) - the apex zone only routes /.well-known/matrix/*
+  const apiDomain = c.env.WORKER_DOMAIN || c.env.SERVER_NAME;
+  const baseUrl = `https://${apiDomain}`;
 
   // This server acts as its own OIDC provider, and Element Web only accepts the
   // configuration when every field below is present.
@@ -444,18 +446,9 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
       'urn:matrix:org.matrix.msc2967.client:api:*',
       'urn:matrix:org.matrix.msc2967.client:device:*',
     ],
-    // Matrix authentication service extension (MSC3861/MSC4191)
-    // account_management_uri is where users can manage their account
-    account_management_uri: `${baseUrl}/admin`,
-    // Supported account management actions per MSC4191
-    // Element X uses these to determine what features are available
-    account_management_actions_supported: [
-      'org.matrix.profile',              // View/edit profile
-      'org.matrix.sessions_list',        // View list of sessions  
-      'org.matrix.session_view',         // View details of a specific session
-      'org.matrix.session_end',          // End/logout a specific session
-      'org.matrix.cross_signing_reset',  // Reset cross-signing keys (identity reset)
-    ],
+    // MSC4191 account management is deliberately not advertised: it hands session
+    // management to an external console this server does not have (/admin is admin-only),
+    // and Element Web hides its in-app sign-out UI as soon as it is advertised.
     // Device authorization endpoint for QR code login (MSC4108)
     device_authorization_endpoint: `${baseUrl}/oauth/device`,
     // Prompt values we support

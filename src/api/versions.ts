@@ -45,8 +45,9 @@ app.get('/.well-known/matrix/server', (c) => {
 // GET /.well-known/openid-configuration - OIDC discovery, required by Element Web's
 // OIDC-native login. Spec: https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api
 app.get('/.well-known/openid-configuration', (c) => {
-  const serverName = c.env.SERVER_NAME;
-  const baseUrl = `https://${serverName}`;
+  // OAuth endpoints live on the worker API domain, not the apex (see routes)
+  const apiDomain = c.env.WORKER_DOMAIN || c.env.SERVER_NAME;
+  const baseUrl = `https://${apiDomain}`;
 
   // Element Web requires every field of this discovery document to be present
   return c.json({

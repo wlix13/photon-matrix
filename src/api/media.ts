@@ -171,7 +171,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   }
 
   try {
-    const downloadUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+    const downloadUrl = `https://${c.env.WORKER_DOMAIN || c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
     const resized = await fetch(downloadUrl, {
       cf: {
         image: {
@@ -583,7 +583,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   // Try Image Resizing for image content
   if (isImage) {
     try {
-      const downloadUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+      const downloadUrl = `https://${c.env.WORKER_DOMAIN || c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
       const resized = await fetch(downloadUrl, {
         cf: {
           image: {

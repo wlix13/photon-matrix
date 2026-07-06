@@ -581,8 +581,9 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
     const sessionId = await generateOpaqueId(16);
 
     const flows: Array<{ stages: string[] }> = [];
-    const serverName = c.env.SERVER_NAME;
-    const baseUrl = `https://${serverName}`;
+    // UIA approval/OAuth URLs must use the worker API domain, not the apex
+    const apiDomain = c.env.WORKER_DOMAIN || c.env.SERVER_NAME;
+    const baseUrl = `https://${apiDomain}`;
     const params: Record<string, any> = {};
     
     if (userIsOIDC) {
@@ -917,8 +918,9 @@ app.get('/_matrix/client/v3/auth/m.login.sso/redirect', async (c) => {
   }
 
   const session = JSON.parse(sessionJson);
-  const serverName = c.env.SERVER_NAME;
-  const baseUrl = `https://${serverName}`;
+  // OAuth endpoints live on the worker API domain, not the apex
+  const apiDomain = c.env.WORKER_DOMAIN || c.env.SERVER_NAME;
+  const baseUrl = `https://${apiDomain}`;
 
   // Store the redirect URL for after SSO completes
   session.redirect_url = redirectUrl || `${baseUrl}/_matrix/client/v3/auth/m.login.sso/callback`;
