@@ -1,13 +1,79 @@
 // Matrix media endpoints (using R2 for storage)
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { Context } from 'hono';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateOpaqueId } from '../utils/ids';
 import { validateUrlForPreview } from '../utils/url-validator';
+import { fetchRemoteMedia } from '../services/media-federation';
 
 const app = new Hono<AppEnv>();
+
+// Serve media from Cloudflare's edge cache. Media is content-addressed and immutable, so a hit is
+// always valid; auth runs before this, so the cache key is token-independent and shared by all users.
+async function withEdgeCache(
+  c: Context<AppEnv>,
+  cacheKey: string,
+  produce: () => Promise<Response>,
+): Promise<Response> {
+  const cache = (caches as unknown as { default: Cache }).default;
+  const keyReq = new Request(`https://${c.env.SERVER_NAME}/_mediacache/${cacheKey}`);
+  const hit = await cache.match(keyReq);
+  if (hit) return hit;
+
+  const resp = await produce();
+  if (resp.status === 200) {
+    // Cache the clone; return the original stream to the client.
+    c.executionCtx.waitUntil(cache.put(keyReq, resp.clone()));
+  }
+  return resp;
+}
+
+// Fetch a remote server's media over federation and return it to the client,
+// caching the bytes in R2 so repeat views don't re-hit the remote server.
+async function serveRemoteMedia(
+  env: Env,
+  serverName: string,
+  mediaId: string,
+  opts?: { thumbnail?: boolean; width?: number; height?: number; method?: string },
+): Promise<Response> {
+  const cacheKey = opts?.thumbnail
+    ? `remote_thumb:${serverName}:${mediaId}:${opts.width}x${opts.height}:${opts.method}`
+    : `remote:${serverName}:${mediaId}`;
+
+  const cached = await env.MEDIA.get(cacheKey);
+  if (cached) {
+    return new Response(cached.body, {
+      headers: {
+        'Content-Type': cached.httpMetadata?.contentType || 'application/octet-stream',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      },
+    });
+  }
+
+  const media = await fetchRemoteMedia(env, serverName, mediaId, opts);
+  if (!media) {
+    return Errors.notFound('Remote media not found').toResponse();
+  }
+
+  try {
+    await env.MEDIA.put(cacheKey, media.data, {
+      httpMetadata: { contentType: media.contentType },
+    });
+  } catch (err) {
+    console.warn('[media] failed to cache remote media', err);
+  }
+
+  const headers = new Headers();
+  headers.set('Content-Type', media.contentType);
+  if (media.filename) {
+    headers.set('Content-Disposition', `inline; filename="${media.filename.replace(/"/g, '')}"`);
+  }
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return new Response(media.data, { headers });
+}
 
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
@@ -492,26 +558,29 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
   const mediaId = c.req.param('mediaId');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return withEdgeCache(c, `dl/${serverName}/${mediaId}`, () =>
+      serveRemoteMedia(c.env, serverName, mediaId));
   }
 
-  const object = await c.env.MEDIA.get(mediaId);
-  if (!object) {
-    return Errors.notFound('Media not found').toResponse();
-  }
+  return withEdgeCache(c, `dl/${serverName}/${mediaId}`, async () => {
+    const object = await c.env.MEDIA.get(mediaId);
+    if (!object) {
+      return Errors.notFound('Media not found').toResponse();
+    }
 
-  const metadata = await c.env.DB.prepare(
-    `SELECT content_type, filename FROM media WHERE media_id = ?`
-  ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
+    const metadata = await c.env.DB.prepare(
+      `SELECT content_type, filename FROM media WHERE media_id = ?`
+    ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
-  }
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    const headers = new Headers();
+    headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
+    if (metadata?.filename) {
+      headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
+    }
+    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
-  return new Response(object.body, { headers });
+    return new Response(object.body, { headers });
+  });
 });
 
 // GET /_matrix/client/v1/media/download/:serverName/:mediaId/:filename - With filename
@@ -521,24 +590,27 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
   const requestedFilename = c.req.param('filename');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return withEdgeCache(c, `dl/${serverName}/${mediaId}`, () =>
+      serveRemoteMedia(c.env, serverName, mediaId));
   }
 
-  const object = await c.env.MEDIA.get(mediaId);
-  if (!object) {
-    return Errors.notFound('Media not found').toResponse();
-  }
+  return withEdgeCache(c, `dlf/${serverName}/${mediaId}/${requestedFilename}`, async () => {
+    const object = await c.env.MEDIA.get(mediaId);
+    if (!object) {
+      return Errors.notFound('Media not found').toResponse();
+    }
 
-  const metadata = await c.env.DB.prepare(
-    `SELECT content_type FROM media WHERE media_id = ?`
-  ).bind(mediaId).first<{ content_type: string }>();
+    const metadata = await c.env.DB.prepare(
+      `SELECT content_type FROM media WHERE media_id = ?`
+    ).bind(mediaId).first<{ content_type: string }>();
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    const headers = new Headers();
+    headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
+    headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
+    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
-  return new Response(object.body, { headers });
+    return new Response(object.body, { headers });
+  });
 });
 
 // GET /_matrix/client/v1/media/thumbnail/:serverName/:mediaId - Authenticated thumbnail
@@ -550,77 +622,77 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const method = c.req.query('method') || 'scale';
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return withEdgeCache(c, `thumb/${serverName}/${mediaId}/${width}x${height}/${method}`, () =>
+      serveRemoteMedia(c.env, serverName, mediaId, { thumbnail: true, width, height, method }));
   }
 
-  // Get media metadata
-  const metadata = await c.env.DB.prepare(
-    `SELECT content_type FROM media WHERE media_id = ?`
-  ).bind(mediaId).first<{ content_type: string }>();
+  return withEdgeCache(c, `thumb/${serverName}/${mediaId}/${width}x${height}/${method}`, async () => {
+    const metadata = await c.env.DB.prepare(
+      `SELECT content_type FROM media WHERE media_id = ?`
+    ).bind(mediaId).first<{ content_type: string }>();
 
-  if (!metadata) {
-    return Errors.notFound('Media not found').toResponse();
-  }
+    if (!metadata) {
+      return Errors.notFound('Media not found').toResponse();
+    }
 
-  const isImage = metadata.content_type.startsWith('image/');
+    const isImage = metadata.content_type.startsWith('image/');
 
-  // Check for pre-generated thumbnail
-  const thumbnailKey = `thumb_${mediaId}_${width}x${height}_${method}`;
-  const existingThumb = await c.env.MEDIA.get(thumbnailKey);
+    const thumbnailKey = `thumb_${mediaId}_${width}x${height}_${method}`;
+    const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
-  if (existingThumb) {
-    const headers = new Headers();
-    headers.set('Content-Type', 'image/jpeg');
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(existingThumb.body, { headers });
-  }
+    if (existingThumb) {
+      const headers = new Headers();
+      headers.set('Content-Type', 'image/jpeg');
+      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+      return new Response(existingThumb.body, { headers });
+    }
 
-  const object = await c.env.MEDIA.get(mediaId);
-  if (!object) {
-    return Errors.notFound('Media not found').toResponse();
-  }
+    const object = await c.env.MEDIA.get(mediaId);
+    if (!object) {
+      return Errors.notFound('Media not found').toResponse();
+    }
 
-  // Try Image Resizing for image content
-  if (isImage) {
-    try {
-      const downloadUrl = `https://${c.env.WORKER_DOMAIN || c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
-      const resized = await fetch(downloadUrl, {
-        cf: {
-          image: {
-            width,
-            height,
-            fit: method === 'crop' ? 'cover' : 'contain',
-            format: 'jpeg',
-            quality: 85,
+    if (isImage) {
+      try {
+        const downloadUrl = `https://${c.env.WORKER_DOMAIN || c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+        const resized = await fetch(downloadUrl, {
+          cf: {
+            image: {
+              width,
+              height,
+              fit: method === 'crop' ? 'cover' : 'contain',
+              format: 'jpeg',
+              quality: 85,
+            },
           },
-        },
-      });
-
-      if (resized.ok) {
-        const thumbBody = await resized.arrayBuffer();
-        await c.env.MEDIA.put(thumbnailKey, thumbBody, {
-          httpMetadata: { contentType: 'image/jpeg' },
         });
 
-        const resHeaders = new Headers();
-        resHeaders.set('Content-Type', 'image/jpeg');
-        resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
-        resHeaders.set('X-Thumbnail-Generated', 'true');
-        return new Response(thumbBody, { headers: resHeaders });
+        if (resized.ok) {
+          const thumbBody = await resized.arrayBuffer();
+          await c.env.MEDIA.put(thumbnailKey, thumbBody, {
+            httpMetadata: { contentType: 'image/jpeg' },
+          });
+
+          const resHeaders = new Headers();
+          resHeaders.set('Content-Type', 'image/jpeg');
+          resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
+          resHeaders.set('X-Thumbnail-Generated', 'true');
+          return new Response(thumbBody, { headers: resHeaders });
+        }
+      } catch (resizeErr) {
+        console.warn('[media] Image resize failed:', resizeErr);
       }
-    } catch (resizeErr) {
-      console.warn('[media] Image resize failed:', resizeErr);
     }
-  }
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata.content_type);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  if (isImage) {
-    headers.set('X-Thumbnail-Generated', 'false');
-  }
+    const headers = new Headers();
+    headers.set('Content-Type', metadata.content_type);
+    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    if (isImage) {
+      headers.set('X-Thumbnail-Generated', 'false');
+    }
 
-  return new Response(object.body, { headers });
+    return new Response(object.body, { headers });
+  });
 });
 
 // GET /_matrix/client/v1/media/preview_url - Authenticated URL preview

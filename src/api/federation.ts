@@ -12,6 +12,7 @@ import {
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { sendPduToServers, getRemoteServersInRoom } from '../services/federation-sender';
+import { buildMultipartMediaResponse } from '../services/media-federation';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import {
@@ -2665,34 +2666,28 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
   });
 });
 
-// ============================================
-// Federation Media Endpoints
-// Serve local media to remote servers
-// ============================================
+// Federation media endpoints - serve local media to remote servers
 
 // GET /_matrix/federation/v1/media/download/:mediaId - Download media via federation
+// The response must be multipart/mixed: a JSON metadata part plus the media part.
 app.get('/_matrix/federation/v1/media/download/:mediaId', async (c) => {
   const mediaId = c.req.param('mediaId');
 
-  // Get media from R2
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // Get metadata from D1
   const metadata = await c.env.DB.prepare(
     `SELECT content_type, filename FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
-  }
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-
-  return new Response(object.body, { headers });
+  const data = new Uint8Array(await object.arrayBuffer());
+  return buildMultipartMediaResponse(
+    data,
+    metadata?.content_type || 'application/octet-stream',
+    metadata?.filename || undefined
+  );
 });
 
 // GET /_matrix/federation/v1/media/thumbnail/:mediaId - Get thumbnail via federation
@@ -2722,26 +2717,19 @@ app.get('/_matrix/federation/v1/media/thumbnail/:mediaId', async (c) => {
     return new Response(existingThumb.body, { headers });
   }
 
-  // Get original
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // If not an image, return original
-  const headers = new Headers();
-  headers.set('Content-Type', metadata.content_type);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  if (isImage) {
-    headers.set('X-Thumbnail-Generated', 'false');
-  }
-
-  return new Response(object.body, { headers });
+  // Thumbnails are not generated here: the original bytes go back as the media
+  // part of the required multipart/mixed response and the requester scales them.
+  void isImage;
+  const data = new Uint8Array(await object.arrayBuffer());
+  return buildMultipartMediaResponse(data, metadata.content_type);
 });
 
-// ============================================
-// Federation Public Rooms Directory
-// ============================================
+// Federation public rooms directory
 
 // GET /_matrix/federation/v1/publicRooms - Get public rooms
 app.get('/_matrix/federation/v1/publicRooms', async (c) => {
