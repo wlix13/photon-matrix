@@ -544,7 +544,7 @@ async function getRoomData(
     if (isIncremental) {
       // Incremental: get events since the last sync position
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, redacts, redacted_because
         FROM events
         WHERE room_id = ? AND stream_ordering > ?
         ORDER BY stream_ordering ASC
@@ -554,7 +554,7 @@ async function getRoomData(
     } else {
       // Initial: get the most recent events
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, redacts, redacted_because
         FROM events
         WHERE room_id = ?
         ORDER BY stream_ordering DESC
@@ -576,7 +576,7 @@ async function getRoomData(
 
     result.timeline = eventsToProcess.map(event => {
       try {
-        return {
+        const clientEvent: Record<string, any> = {
           type: event.event_type,
           event_id: event.event_id,
           sender: event.sender,
@@ -585,6 +585,20 @@ async function getRoomData(
           state_key: event.state_key || undefined,
           unsigned: event.unsigned ? JSON.parse(event.unsigned) : undefined,
         };
+        // Redaction event: expose the target so clients delete it live
+        if (event.redacts) {
+          clientEvent.redacts = event.redacts;
+          clientEvent.content = { ...clientEvent.content, redacts: event.redacts };
+        }
+        // Redacted target: serve emptied content + redacted_because marker
+        if (event.redacted_because) {
+          clientEvent.content = {};
+          clientEvent.unsigned = {
+            ...(clientEvent.unsigned || {}),
+            redacted_because: { event_id: event.redacted_because, type: 'm.room.redaction' },
+          };
+        }
+        return clientEvent;
       } catch {
         return {
           type: event.event_type,

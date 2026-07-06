@@ -13,33 +13,50 @@ interface UnreadEvent {
   state_key?: string;
 }
 
-/**
- * Count notifications and highlights for unread events in a room
- * using the user's push rules for accurate counting.
- */
+/** Count notifications and highlights for a room's unread events using the user's push rules. */
 export async function countNotificationsWithRules(
   db: D1Database,
   userId: string,
   roomId: string,
   sinceStreamOrdering?: number,
 ): Promise<{ notification_count: number; highlight_count: number }> {
-  // Get the user's read marker
+  // The badge clears on the m.read receipt (sent automatically when a message is viewed), not on
+  // the m.fully_read marker (explicit "mark as read"), so take whichever position is furthest along.
   let readStreamOrdering = sinceStreamOrdering;
 
   if (readStreamOrdering === undefined) {
+    const readEventIds: string[] = [];
+
+    // m.read / m.read.private receipts (main timeline) for this user
+    const receipts = await db.prepare(`
+      SELECT event_id FROM receipts
+      WHERE user_id = ? AND room_id = ? AND thread_id = ''
+        AND receipt_type IN ('m.read', 'm.read.private')
+    `).bind(userId, roomId).all<{ event_id: string }>();
+    for (const r of receipts.results) readEventIds.push(r.event_id);
+
+    // m.fully_read marker (from account data)
     const fullyReadMarker = await db.prepare(`
       SELECT content FROM account_data
       WHERE user_id = ? AND room_id = ? AND event_type = 'm.fully_read'
     `).bind(userId, roomId).first<{ content: string }>();
-
     if (fullyReadMarker) {
       try {
         const markerContent = JSON.parse(fullyReadMarker.content);
-        const readEvent = await db.prepare(`
-          SELECT stream_ordering FROM events WHERE event_id = ?
-        `).bind(markerContent.event_id).first<{ stream_ordering: number }>();
-        readStreamOrdering = readEvent?.stream_ordering;
+        if (markerContent.event_id) readEventIds.push(markerContent.event_id);
       } catch { /* ignore */ }
+    }
+
+    // Resolve to the furthest-along stream_ordering across all read markers
+    for (const eventId of readEventIds) {
+      const ev = await db.prepare(`
+        SELECT stream_ordering FROM events WHERE event_id = ?
+      `).bind(eventId).first<{ stream_ordering: number }>();
+      if (ev?.stream_ordering !== undefined && ev.stream_ordering !== null) {
+        if (readStreamOrdering === undefined || ev.stream_ordering > readStreamOrdering) {
+          readStreamOrdering = ev.stream_ordering;
+        }
+      }
     }
   }
 

@@ -260,10 +260,17 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
 
   const streamOrdering = (lastOrdering?.max_ordering ?? 0) + 1;
 
+  // A redaction's target is top-level `redacts` in room v1-v10 and
+  // content.redacts in v11+; store whichever is present.
+  const redacts =
+    (event as { redacts?: string }).redacts ??
+    (event.content as { redacts?: string } | undefined)?.redacts ??
+    null;
+
   await db.prepare(
     `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering, redacts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     event.event_id,
     event.room_id,
@@ -278,7 +285,8 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     JSON.stringify(event.prev_events),
     event.hashes ? JSON.stringify(event.hashes) : null,
     event.signatures ? JSON.stringify(event.signatures) : null,
-    streamOrdering
+    streamOrdering,
+    redacts
   ).run();
 
   // Update room state if this is a state event
@@ -287,6 +295,13 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
       `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
        VALUES (?, ?, ?, ?)`
     ).bind(event.room_id, event.type, event.state_key, event.event_id).run();
+  }
+
+  // Flag the target event so later reads serve it redacted.
+  if (event.type === 'm.room.redaction' && redacts) {
+    await db.prepare(
+      `UPDATE events SET redacted_because = ? WHERE event_id = ? AND room_id = ?`
+    ).bind(event.event_id, redacts, event.room_id).run();
   }
 
   return streamOrdering;
@@ -600,7 +615,7 @@ export async function getEventsSince(
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events
+     origin_server_ts, unsigned, depth, auth_events, prev_events, redacts, redacted_because
      FROM events
      WHERE room_id = ? AND stream_ordering > ?
      ORDER BY stream_ordering ASC
@@ -617,9 +632,11 @@ export async function getEventsSince(
     depth: number;
     auth_events: string;
     prev_events: string;
+    redacts: string | null;
+    redacted_because: string | null;
   }>();
 
-  return result.results.map(r => ({
+  return result.results.map(r => applyRedactionToPdu({
     event_id: r.event_id,
     room_id: r.room_id,
     sender: r.sender,
@@ -631,7 +648,29 @@ export async function getEventsSince(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
-  }));
+  }, r.redacts, r.redacted_because));
+}
+
+// Shape a stored event for client delivery: a redaction gets its target in both
+// top-level `redacts` (read by pre-v11 clients) and content.redacts; a redacted
+// event gets emptied content plus an unsigned.redacted_because pointer.
+function applyRedactionToPdu(
+  pdu: PDU,
+  redacts: string | null,
+  redactedBecause: string | null,
+): PDU {
+  if (pdu.type === 'm.room.redaction' && redacts) {
+    (pdu as { redacts?: string }).redacts = redacts;
+    pdu.content = { ...(pdu.content as object), redacts };
+  }
+  if (redactedBecause) {
+    pdu.content = {};
+    pdu.unsigned = {
+      ...(pdu.unsigned as object | undefined),
+      redacted_because: { event_id: redactedBecause, type: 'm.room.redaction' },
+    } as PDU['unsigned'];
+  }
+  return pdu;
 }
 
 // Batch retrieve events by IDs

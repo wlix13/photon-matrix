@@ -17,6 +17,31 @@ function getRoomDO(env: Env, roomId: string) {
   return env.ROOMS.get(id);
 }
 
+// Federate a public m.read receipt to the remote servers in the room so the
+// original sender's client shows "seen". Private receipts are never federated.
+async function federateReadReceipt(
+  env: Env,
+  roomId: string,
+  userId: string,
+  eventId: string,
+): Promise<void> {
+  const { getRemoteServersInRoom, sendEduToServer } = await import('../services/federation-sender');
+  const servers = await getRemoteServersInRoom(env.DB, roomId, env.SERVER_NAME);
+  if (servers.length === 0) return;
+
+  const content = {
+    [roomId]: {
+      'm.read': {
+        [userId]: {
+          data: { ts: Date.now() },
+          event_ids: [eventId],
+        },
+      },
+    },
+  };
+  await Promise.all(servers.map(s => sendEduToServer(env, s, 'm.receipt', content)));
+}
+
 // ============================================
 // Endpoints
 // ============================================
@@ -87,6 +112,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
           content = excluded.content
       `).bind(userId, roomId, JSON.stringify({ event_id: eventId })).run();
       console.log('[receipts] Also updated m.fully_read in account_data for', userId, 'in room', roomId);
+
+      c.executionCtx.waitUntil(federateReadReceipt(c.env, roomId, userId, eventId));
     }
   }
 

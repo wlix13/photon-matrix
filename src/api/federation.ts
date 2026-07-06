@@ -825,12 +825,16 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           hashes: pdu.hashes,
           signatures: pdu.signatures,
         };
+        // redacts is top-level for room v1-v10; storeEvent needs it to mark the target.
+        if ((pdu as { redacts?: string }).redacts) {
+          (storedEvent as { redacts?: string }).redacts = (pdu as { redacts?: string }).redacts;
+        }
         await storeEvent(c.env.DB, storedEvent);
 
         if (pdu.state_key !== undefined) {
-          // If the PDU forks history (multiple prev_events), run state resolution
-          // to pick the authoritative event for each (type, state_key). storeEvent
-          // has already applied a last-writer-wins update, which this overrides.
+          // Forked history (multiple prev_events) needs state resolution to pick
+          // the authoritative event per (type, state_key), overriding the
+          // last-writer-wins update storeEvent already applied.
           const prevEvents = pdu.prev_events || [];
           if (prevEvents.length > 1) {
             try {

@@ -1,12 +1,13 @@
 // Matrix sync endpoint
 
 import { Hono } from 'hono';
-import type { AppEnv, SyncResponse, JoinedRoom, InvitedRoom, LeftRoom, Env } from '../types';
+import type { AppEnv, SyncResponse, JoinedRoom, InvitedRoom, LeftRoom, Env, PDU } from '../types';
 import { requireAuth } from '../middleware/auth';
 import {
   getUserRooms,
   getRoomState,
   getEventsSince,
+  getStateEvent,
   getLatestStreamPosition,
 } from '../services/database';
 import { getToDeviceMessages } from './to-device';
@@ -17,6 +18,7 @@ import {
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
+import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 
 // ============================================
 // Sync Filter Types and Helpers
@@ -423,7 +425,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     let timelineEvents: any[] = [];
 
     for (const event of events) {
-      const clientEvent = {
+      const clientEvent: Record<string, any> = {
         type: event.type,
         state_key: event.state_key,
         content: event.content,
@@ -433,6 +435,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         room_id: event.room_id,
         unsigned: event.unsigned,
       };
+      // Redaction target (pre-v11 clients read the top-level `redacts`)
+      if ((event as { redacts?: string }).redacts) {
+        clientEvent.redacts = (event as { redacts?: string }).redacts;
+      }
 
       if (event.state_key !== undefined) {
         // State event - include in both state and timeline
@@ -502,6 +508,13 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       filter?.room?.ephemeral
     );
 
+    // Unread notification and highlight counts, cleared by the user's m.read receipt.
+    const counts = await countNotificationsWithRules(c.env.DB, userId, roomId);
+    joinedRoom.unread_notifications = {
+      notification_count: counts.notification_count,
+      highlight_count: counts.highlight_count,
+    };
+
     response.rooms!.join![roomId] = joinedRoom;
   }
 
@@ -548,22 +561,32 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     response.rooms!.invite![roomId] = invitedRoom;
   }
 
-  // Get left rooms (rooms user left since last sync)
-  // Check if filter allows left rooms (default: false per spec)
+  // include_leave only governs leaves older than the sync window. A leave since the client's
+  // token always ships, filter or not: it is how the client learns the room is gone, and
+  // Element sends a filter without include_leave on every sync.
   const includeLeave = filter?.room?.include_leave ?? false;
-  if (sincePosition > 0 && (includeLeave || !filter)) {
+  if (sincePosition > 0 || includeLeave) {
     const leftRoomIds = await getUserRooms(c.env.DB, userId, 'leave');
     for (const roomId of leftRoomIds) {
-      // Check if room should be included based on filter
       if (!shouldIncludeRoom(roomId, filter?.room)) {
         continue;
       }
 
-      // Only include if membership changed since last sync
-      const events = await getEventsSince(c.env.DB, roomId, sincePosition);
-      const leaveEvent = events.find(
-        e => e.type === 'm.room.member' && e.state_key === userId
-      );
+      // Last own membership event wins: an earlier join in the same window is not the leave.
+      let leaveEvent: PDU | null = null;
+      if (sincePosition > 0) {
+        const events = await getEventsSince(c.env.DB, roomId, sincePosition);
+        for (const event of events) {
+          if (event.type === 'm.room.member' && event.state_key === userId) {
+            leaveEvent = event;
+          }
+        }
+      }
+
+      // Nothing in the window: a historical leave, which only include_leave asks for.
+      if (!leaveEvent && includeLeave) {
+        leaveEvent = await getStateEvent(c.env.DB, roomId, 'm.room.member', userId);
+      }
 
       if (leaveEvent) {
         const leftRoom: LeftRoom = {
