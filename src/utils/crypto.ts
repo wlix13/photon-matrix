@@ -187,18 +187,17 @@ export async function signJson(
     ['sign']
   );
 
-  // Get canonical JSON representation
   const canonical = canonicalJson(toSign);
 
-  // Sign the canonical JSON
   const signatureBytes = await crypto.subtle.sign(
     { name: 'NODE-ED25519' },
     privateKey,
     new TextEncoder().encode(canonical)
   );
 
-  // Encode signature as unpadded base64
-  const signatureB64 = base64UrlEncode(new Uint8Array(signatureBytes));
+  // Unpadded standard base64, not URL-safe: remote servers compare against
+  // their own standard-base64 encoding.
+  const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signatureBytes))).replace(/=+$/, '');
 
   // Merge with existing signatures if present
   const existingSignatures = (obj.signatures as Record<string, Record<string, string>>) || {};
@@ -291,15 +290,19 @@ export function canonicalJson(obj: unknown): string {
   return 'null';
 }
 
-// Calculate content hash for PDU
+// Content hash for a PDU: strip unsigned, signatures, hashes and event_id (v3+
+// wire events carry none), canonicalize, then SHA-256 as unpadded standard
+// base64 - remote servers compare against their own standard-base64 encoding.
 export async function calculateContentHash(content: Record<string, unknown>): Promise<string> {
-  // Remove signatures and unsigned before hashing
   const toHash = { ...content };
   delete toHash['signatures'];
   delete toHash['unsigned'];
+  delete toHash['hashes'];
+  delete toHash['event_id'];
 
   const canonical = canonicalJson(toHash);
-  return sha256(canonical);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/=+$/, '');
 }
 
 // Verify content hash

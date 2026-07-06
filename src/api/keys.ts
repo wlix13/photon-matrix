@@ -313,8 +313,21 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
     return deviceKey;
   }
 
+  // Split requested users into local (served from our DO) and remote (proxied
+  // to their homeserver over federation, so a local user can encrypt to them).
+  const localServer = c.env.SERVER_NAME;
+  const remoteByServer: Record<string, Record<string, string[]>> = {};
+
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      const userServer = userId.slice(userId.indexOf(':') + 1);
+      if (userServer && userServer !== localServer) {
+        const server = userServer;
+        if (!remoteByServer[server]) remoteByServer[server] = {};
+        remoteByServer[server][userId] = Array.isArray(devices) ? devices as string[] : [];
+        continue;
+      }
+
       deviceKeys[userId] = {};
 
       // An empty device list means "all of this user's devices"
@@ -353,6 +366,39 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
     }
   }
 
+  // Proxy remote users' key queries to their homeservers and merge the results.
+  const remoteServers = Object.keys(remoteByServer);
+  if (remoteServers.length > 0) {
+    const { federationPost } = await import('../services/federation-keys');
+    await Promise.all(remoteServers.map(async (server) => {
+      try {
+        const resp = await federationPost(
+          server,
+          '/_matrix/federation/v1/user/keys/query',
+          { device_keys: remoteByServer[server] },
+          localServer,
+          db,
+          c.env.CACHE,
+        );
+        if (!resp.ok) {
+          failures[server] = { status: resp.status };
+          return;
+        }
+        const remote = await resp.json() as {
+          device_keys?: Record<string, any>;
+          master_keys?: Record<string, any>;
+          self_signing_keys?: Record<string, any>;
+        };
+        Object.assign(deviceKeys, remote.device_keys ?? {});
+        Object.assign(masterKeys, remote.master_keys ?? {});
+        Object.assign(selfSigningKeys, remote.self_signing_keys ?? {});
+      } catch (err) {
+        console.error('[keys/query] remote query failed for', server, err);
+        failures[server] = { message: 'Federation request failed' };
+      }
+    }));
+  }
+
   // Counts only: a device that comes back with no keys is what clients report as
   // "doesn't support encryption", so this line is the first thing to check.
   const querySummary = Object.entries(deviceKeys).map(([uid, devs]) =>
@@ -385,8 +431,19 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
   const oneTimeKeys: Record<string, Record<string, Record<string, any>>> = {};
   const failures: Record<string, any> = {};
 
+  const localServer = c.env.SERVER_NAME;
+  const remoteClaimByServer: Record<string, Record<string, Record<string, string>>> = {};
+
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      const userServer = userId.slice(userId.indexOf(':') + 1);
+      // Remote user: claim their one-time keys over federation
+      if (userServer && userServer !== localServer) {
+        if (!remoteClaimByServer[userServer]) remoteClaimByServer[userServer] = {};
+        remoteClaimByServer[userServer][userId] = devices as Record<string, string>;
+        continue;
+      }
+
       oneTimeKeys[userId] = {};
 
       for (const [deviceId, algorithm] of Object.entries(devices as Record<string, string>)) {
@@ -473,6 +530,33 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
         }
       }
     }
+  }
+
+  // Proxy remote one-time-key claims to their homeservers and merge results.
+  const remoteClaimServers = Object.keys(remoteClaimByServer);
+  if (remoteClaimServers.length > 0) {
+    const { federationPost } = await import('../services/federation-keys');
+    await Promise.all(remoteClaimServers.map(async (server) => {
+      try {
+        const resp = await federationPost(
+          server,
+          '/_matrix/federation/v1/user/keys/claim',
+          { one_time_keys: remoteClaimByServer[server] },
+          localServer,
+          db,
+          c.env.CACHE,
+        );
+        if (!resp.ok) {
+          failures[server] = { status: resp.status };
+          return;
+        }
+        const remote = await resp.json() as { one_time_keys?: Record<string, any> };
+        Object.assign(oneTimeKeys, remote.one_time_keys ?? {});
+      } catch (err) {
+        console.error('[keys/claim] remote claim failed for', server, err);
+        failures[server] = { message: 'Federation request failed' };
+      }
+    }));
   }
 
   return c.json({

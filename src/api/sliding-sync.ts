@@ -662,34 +662,48 @@ async function getInviteRoomData(
     'm.room.member',  // Only for inviter and invitee
   ];
 
-  const inviteState: any[] = [];
+  let inviteState: any[] = [];
 
-  for (const eventType of strippedStateTypes) {
-    let query = `
-      SELECT e.event_type, e.state_key, e.content, e.sender
-      FROM room_state rs
-      JOIN events e ON rs.event_id = e.event_id
-      WHERE rs.room_id = ? AND rs.event_type = ?
-    `;
-    const params: any[] = [roomId, eventType];
+  // Remote invites carry their stripped state on the membership row; local
+  // invites have none, so it is derived from the room's current state.
+  const storedInvite = await db.prepare(
+    `SELECT invite_state FROM room_memberships WHERE room_id = ? AND user_id = ?`
+  ).bind(roomId, userId).first<{ invite_state: string | null }>();
 
-    // For member events, only include the invitee's own membership
-    if (eventType === 'm.room.member') {
-      query += ` AND rs.state_key = ?`;
-      params.push(userId);
+  if (storedInvite?.invite_state) {
+    try {
+      inviteState = JSON.parse(storedInvite.invite_state);
+    } catch {
+      inviteState = [];
     }
+  } else {
+    for (const eventType of strippedStateTypes) {
+      let query = `
+        SELECT e.event_type, e.state_key, e.content, e.sender
+        FROM room_state rs
+        JOIN events e ON rs.event_id = e.event_id
+        WHERE rs.room_id = ? AND rs.event_type = ?
+      `;
+      const params: any[] = [roomId, eventType];
 
-    const events = await db.prepare(query).bind(...params).all();
+      // For member events, only include the invitee's own membership
+      if (eventType === 'm.room.member') {
+        query += ` AND rs.state_key = ?`;
+        params.push(userId);
+      }
 
-    for (const event of events.results as any[]) {
-      try {
-        inviteState.push({
-          type: event.event_type,
-          state_key: event.state_key,
-          content: JSON.parse(event.content),
-          sender: event.sender,
-        });
-      } catch { /* ignore parse errors */ }
+      const events = await db.prepare(query).bind(...params).all();
+
+      for (const event of events.results as any[]) {
+        try {
+          inviteState.push({
+            type: event.event_type,
+            state_key: event.state_key,
+            content: JSON.parse(event.content),
+            sender: event.sender,
+          });
+        } catch { /* ignore parse errors */ }
+      }
     }
   }
 

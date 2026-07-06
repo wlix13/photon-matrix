@@ -90,19 +90,30 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
     return Errors.missingParam('messages').toResponse();
   }
 
+  const localServer = c.env.SERVER_NAME;
+  const localRecipients: string[] = [];
+  // Remote deliveries grouped by destination server, preserving the original
+  // per-user/per-device structure for the m.direct_to_device EDU.
+  const remoteByServer: Record<string, Record<string, Record<string, any>>> = {};
+
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
-    // Get list of device IDs to send to
-    let targetDevices: string[];
+    const recipientServer = recipientUserId.slice(recipientUserId.indexOf(':') + 1);
 
+    // Remote recipient: batch into an m.direct_to_device EDU per destination.
+    // Their devices live on their own server - we do not resolve '*' here.
+    if (recipientServer && recipientServer !== localServer) {
+      if (!remoteByServer[recipientServer]) remoteByServer[recipientServer] = {};
+      remoteByServer[recipientServer][recipientUserId] = deviceMessages;
+      continue;
+    }
+
+    // Local recipient: store per-device for delivery via the recipient's /sync
+    localRecipients.push(recipientUserId);
     for (const [deviceId, content] of Object.entries(deviceMessages)) {
-      if (deviceId === '*') {
-        // Send to all devices for this user
-        targetDevices = await getUserDevices(db, recipientUserId);
-      } else {
-        targetDevices = [deviceId];
-      }
+      const targetDevices = deviceId === '*'
+        ? await getUserDevices(db, recipientUserId)
+        : [deviceId];
 
-      // Create a message for each target device
       for (const targetDeviceId of targetDevices) {
         const streamPosition = await getNextStreamPosition(db, 'to_device');
         const messageId = `${userId}_${txnId}_${recipientUserId}_${targetDeviceId}_${Date.now()}`;
@@ -133,9 +144,27 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
     ON CONFLICT (user_id, txn_id) DO NOTHING
   `).bind(userId, txnId).run();
 
-  // Wake recipients' long-polling sync after the response is sent - the
-  // messages are already committed to D1 at this point
-  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, Object.keys(body.messages)));
+  // Wake local recipients' long-polling sync (messages are committed to D1)
+  if (localRecipients.length > 0) {
+    c.executionCtx.waitUntil(wakeSyncForUsers(c.env, localRecipients));
+  }
+
+  // Fan out to remote servers as m.direct_to_device EDUs (E2EE key sharing).
+  // Each destination gets only its own users' messages.
+  const remoteServers = Object.keys(remoteByServer);
+  if (remoteServers.length > 0) {
+    c.executionCtx.waitUntil((async () => {
+      const { sendEduToServer } = await import('../services/federation-sender');
+      await Promise.all(remoteServers.map(server =>
+        sendEduToServer(c.env, server, 'm.direct_to_device', {
+          sender: userId,
+          type: eventType,
+          message_id: `${userId}_${txnId}`,
+          messages: remoteByServer[server],
+        })
+      ));
+    })());
+  }
 
   return c.json({});
 });

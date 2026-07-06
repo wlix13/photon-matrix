@@ -1,7 +1,11 @@
-// Federation Durable Object for server-to-server communication
+// Durable retry queue for outbound federation, one instance per destination server (keyed
+// by idFromName(server)). PDUs that services/federation-sender.ts failed to deliver
+// directly are queued here and retried on an exponential-backoff alarm until they succeed.
+// PDUs and EDUs both go out over the signed X-Matrix transport; a raw fetch() gets 401.
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
+import { getServerSigningKey, makeFederationRequest } from '../services/federation-keys';
 
 interface FederationTarget {
   serverName: string;
@@ -10,11 +14,11 @@ interface FederationTarget {
   nextRetry: number | null;
 }
 
-interface OutboundEvent {
-  event_id: string;
-  room_id: string;
+// A finalized wire PDU awaiting (re)delivery to a single destination.
+interface OutboundPdu {
   destination: string;
-  pdu: any;
+  roomId: string;
+  wirePdu: any;
   created_at: number;
   retry_count: number;
 }
@@ -24,6 +28,17 @@ interface OutboundEdu {
   destination: string;
   content: any;
   created_at: number;
+}
+
+// Spec limits: <=50 PDUs and <=100 EDUs per federation transaction.
+const MAX_PDUS_PER_TXN = 50;
+const MAX_EDUS_PER_TXN = 100;
+
+// Unique-per-isolate transaction id suffix.
+let txnCounter = 0;
+function nextTxnId(): string {
+  txnCounter = (txnCounter + 1) % 1_000_000;
+  return `${Date.now()}_${txnCounter}`;
 }
 
 export class FederationDurableObject extends DurableObject<Env> {
@@ -58,30 +73,33 @@ export class FederationDurableObject extends DurableObject<Env> {
     return new Response('Not found', { status: 404 });
   }
 
-  // Queue an event for federation to a remote server
+  // Enqueues a PDU whose direct send already failed; the backoff alarm performs the signed delivery.
   private async handleSend(request: Request): Promise<Response> {
-    const data = await request.json() as {
+    const data = (await request.json()) as {
       destination: string;
-      event_id: string;
-      room_id: string;
-      pdu: any;
+      roomId: string;
+      wirePdu: any;
     };
 
-    const outboundEvent: OutboundEvent = {
-      event_id: data.event_id,
-      room_id: data.room_id,
+    if (!data.destination || !data.wirePdu) {
+      return new Response(
+        JSON.stringify({ errcode: 'M_MISSING_PARAM', error: 'destination and wirePdu required' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const entry: OutboundPdu = {
       destination: data.destination,
-      pdu: data.pdu,
+      roomId: data.roomId,
+      wirePdu: data.wirePdu,
       created_at: Date.now(),
       retry_count: 0,
     };
 
-    // Store in queue
-    const key = `queue:${data.destination}:${data.event_id}`;
-    await this.ctx.storage.put(key, outboundEvent);
+    const key = `queue:${data.destination}:${entry.created_at}:${Math.random().toString(36).slice(2)}`;
+    await this.ctx.storage.put(key, entry);
 
-    // Try to send immediately
-    await this.processFederationQueue(data.destination);
+    await this.scheduleRetry(data.destination);
 
     return new Response('Queued');
   }
@@ -90,23 +108,22 @@ export class FederationDurableObject extends DurableObject<Env> {
   private async handleReceive(request: Request): Promise<Response> {
     const origin = request.headers.get('X-Matrix-Origin');
     if (!origin) {
-      return new Response(JSON.stringify({
-        errcode: 'M_MISSING_PARAM',
-        error: 'Missing origin header',
-      }), { status: 400 });
+      return new Response(
+        JSON.stringify({
+          errcode: 'M_MISSING_PARAM',
+          error: 'Missing origin header',
+        }),
+        { status: 400 }
+      );
     }
 
-    // Verify request signature (simplified)
-    // In production, verify against the server's signing keys
-
-    const data = await request.json() as {
+    const data = (await request.json()) as {
       pdus: any[];
       edus?: any[];
     };
 
     const processedPdus: string[] = [];
     for (const pdu of data.pdus || []) {
-      // Store the event
       await this.ctx.storage.put(`received:${pdu.event_id}`, {
         pdu,
         origin,
@@ -115,7 +132,6 @@ export class FederationDurableObject extends DurableObject<Env> {
       processedPdus.push(pdu.event_id);
     }
 
-    // Update server status
     const target: FederationTarget = {
       serverName: origin,
       lastContact: Date.now(),
@@ -124,11 +140,14 @@ export class FederationDurableObject extends DurableObject<Env> {
     };
     await this.ctx.storage.put(`server:${origin}`, target);
 
-    return new Response(JSON.stringify({
-      pdus: processedPdus.reduce((acc, id) => ({ ...acc, [id]: {} }), {}),
-    }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({
+        pdus: processedPdus.reduce((acc, id) => ({ ...acc, [id]: {} }), {}),
+      }),
+      {
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
   }
 
   // Get federation status for a server
@@ -137,13 +156,14 @@ export class FederationDurableObject extends DurableObject<Env> {
     const serverName = url.searchParams.get('server');
 
     if (serverName) {
-      const target = await this.ctx.storage.get(`server:${serverName}`) as FederationTarget | undefined;
+      const target = (await this.ctx.storage.get(`server:${serverName}`)) as
+        | FederationTarget
+        | undefined;
       return new Response(JSON.stringify(target || { serverName, status: 'unknown' }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    // List all known servers
     const servers: FederationTarget[] = [];
     const allKeys = await this.ctx.storage.list({ prefix: 'server:' });
     for (const [, value] of allKeys) {
@@ -155,19 +175,21 @@ export class FederationDurableObject extends DurableObject<Env> {
     });
   }
 
-  // Handle server key requests
+  // Handle server key requests (key server endpoint - not X-Matrix authenticated).
   private async handleKeys(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const serverName = url.searchParams.get('server');
 
     if (!serverName) {
-      return new Response(JSON.stringify({
-        errcode: 'M_MISSING_PARAM',
-        error: 'Missing server parameter',
-      }), { status: 400 });
+      return new Response(
+        JSON.stringify({
+          errcode: 'M_MISSING_PARAM',
+          error: 'Missing server parameter',
+        }),
+        { status: 400 }
+      );
     }
 
-    // Get cached keys
     const cachedKeys = await this.ctx.storage.get(`keys:${serverName}`);
     if (cachedKeys) {
       const keys = cachedKeys as { data: any; expires: number };
@@ -178,21 +200,19 @@ export class FederationDurableObject extends DurableObject<Env> {
       }
     }
 
-    // Fetch keys from remote server
     try {
       const response = await fetch(`https://${serverName}/_matrix/key/v2/server`, {
         headers: {
-          'Accept': 'application/json',
+          Accept: 'application/json',
         },
       });
 
       if (response.ok) {
         const data = await response.json();
 
-        // Cache for 24 hours
         await this.ctx.storage.put(`keys:${serverName}`, {
           data,
-          expires: Date.now() + (24 * 60 * 60 * 1000),
+          expires: Date.now() + 24 * 60 * 60 * 1000,
         });
 
         return new Response(JSON.stringify(data), {
@@ -203,15 +223,18 @@ export class FederationDurableObject extends DurableObject<Env> {
       console.error(`Failed to fetch keys from ${serverName}:`, e);
     }
 
-    return new Response(JSON.stringify({
-      errcode: 'M_NOT_FOUND',
-      error: 'Server keys not found',
-    }), { status: 404 });
+    return new Response(
+      JSON.stringify({
+        errcode: 'M_NOT_FOUND',
+        error: 'Server keys not found',
+      }),
+      { status: 404 }
+    );
   }
 
-  // Queue an EDU for federation to a remote server
+  // Queues an EDU for a destination, then flushes that destination's queue.
   private async handleSendEdu(request: Request): Promise<Response> {
-    const data = await request.json() as {
+    const data = (await request.json()) as {
       destination: string;
       edu_type: string;
       content: any;
@@ -224,117 +247,116 @@ export class FederationDurableObject extends DurableObject<Env> {
       created_at: Date.now(),
     };
 
-    // Store in EDU queue
     const key = `edu:${data.destination}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     await this.ctx.storage.put(key, edu);
 
-    // Try to send immediately
+    // EDUs are latency-sensitive (typing/receipts/presence); attempt immediately.
     await this.processFederationQueue(data.destination);
 
     return new Response('Queued');
   }
 
+  // Flushes a destination's pending PDUs and EDUs as one signed transaction.
   private async processFederationQueue(destination: string): Promise<void> {
-    const prefix = `queue:${destination}:`;
-    const allKeys = await this.ctx.storage.list({ prefix });
-
-    const events: OutboundEvent[] = [];
-    for (const [, value] of allKeys) {
-      events.push(value as OutboundEvent);
+    const pduEntries: Array<{ key: string; value: OutboundPdu }> = [];
+    const pduKeys = await this.ctx.storage.list({ prefix: `queue:${destination}:` });
+    for (const [key, value] of pduKeys) {
+      pduEntries.push({ key, value: value as OutboundPdu });
     }
 
-    // Collect pending EDUs
-    const eduPrefix = `edu:${destination}:`;
-    const eduKeys = await this.ctx.storage.list({ prefix: eduPrefix });
-    const edus: OutboundEdu[] = [];
-    const eduKeyNames: string[] = [];
+    const eduEntries: Array<{ key: string; value: OutboundEdu }> = [];
+    const eduKeys = await this.ctx.storage.list({ prefix: `edu:${destination}:` });
     for (const [key, value] of eduKeys) {
-      edus.push(value as OutboundEdu);
-      eduKeyNames.push(key);
+      eduEntries.push({ key, value: value as OutboundEdu });
     }
 
-    if (events.length === 0 && edus.length === 0) return;
+    if (pduEntries.length === 0 && eduEntries.length === 0) return;
 
-    // Sort by creation time
-    events.sort((a, b) => a.created_at - b.created_at);
-    edus.sort((a, b) => a.created_at - b.created_at);
+    // Oldest first, bounded to the spec transaction limits.
+    pduEntries.sort((a, b) => a.value.created_at - b.value.created_at);
+    eduEntries.sort((a, b) => a.value.created_at - b.value.created_at);
+    const pduBatch = pduEntries.slice(0, MAX_PDUS_PER_TXN);
+    const eduBatch = eduEntries.slice(0, MAX_EDUS_PER_TXN);
 
-    // Batch events for transmission
-    const pdus = events.map(e => e.pdu);
-    const eduPayloads = edus.map(e => ({
-      edu_type: e.edu_type,
-      content: e.content,
-    }));
+    const signingKey = await getServerSigningKey(this.env.DB);
+    if (!signingKey) {
+      console.error('[FederationDO] no signing key; deferring delivery', { destination });
+      await this.scheduleRetry(destination);
+      return;
+    }
+
+    const txnId = nextTxnId();
+    const path = `/_matrix/federation/v1/send/${encodeURIComponent(txnId)}`;
+    const body = {
+      origin: this.env.SERVER_NAME,
+      origin_server_ts: Date.now(),
+      pdus: pduBatch.map((e) => e.value.wirePdu),
+      edus: eduBatch.map((e) => ({ edu_type: e.value.edu_type, content: e.value.content })),
+    };
 
     try {
-      const response = await fetch(`https://${destination}/_matrix/federation/v1/send/${Date.now()}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          pdus,
-          edus: eduPayloads,
-        }),
-      });
+      const response = await makeFederationRequest(
+        'PUT',
+        destination,
+        path,
+        this.env.SERVER_NAME,
+        signingKey,
+        this.env.CACHE,
+        body
+      );
 
       if (response.ok) {
-        // Remove sent events from queue
-        for (const event of events) {
-          await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
-        }
-        // Remove sent EDUs
-        for (const key of eduKeyNames) {
-          await this.ctx.storage.delete(key);
-        }
+        await response.text().catch(() => {});
+        for (const { key } of pduBatch) await this.ctx.storage.delete(key);
+        for (const { key } of eduBatch) await this.ctx.storage.delete(key);
 
-        // Update server status
-        const target: FederationTarget = {
+        await this.ctx.storage.put(`server:${destination}`, {
           serverName: destination,
           lastContact: Date.now(),
           retryCount: 0,
           nextRetry: null,
-        };
-        await this.ctx.storage.put(`server:${destination}`, target);
+        } satisfies FederationTarget);
+
+        // More queued than fit in one transaction: keep draining promptly.
+        if (pduEntries.length > pduBatch.length || eduEntries.length > eduBatch.length) {
+          await this.ctx.storage.setAlarm(Date.now() + 1000);
+        }
       } else {
-        // Schedule retry
-        await this.scheduleRetry(destination, events);
+        const text = await response.text().catch(() => '');
+        console.warn('[FederationDO] send failed', {
+          destination,
+          status: response.status,
+          body: text.slice(0, 200),
+        });
+        await this.scheduleRetry(destination);
       }
     } catch (e) {
-      console.error(`Federation send to ${destination} failed:`, e);
-      await this.scheduleRetry(destination, events);
+      console.error(`[FederationDO] send to ${destination} threw:`, e);
+      await this.scheduleRetry(destination);
     }
   }
 
-  private async scheduleRetry(destination: string, events: OutboundEvent[]): Promise<void> {
-    const target = await this.ctx.storage.get(`server:${destination}`) as FederationTarget | undefined;
+  private async scheduleRetry(destination: string): Promise<void> {
+    const target = (await this.ctx.storage.get(`server:${destination}`)) as
+      | FederationTarget
+      | undefined;
     const retryCount = (target?.retryCount || 0) + 1;
 
-    // Exponential backoff: 1min, 2min, 4min, 8min, 16min, max 1hour
+    // Exponential backoff: 1min, 2min, 4min, 8min, 16min, capped at 1 hour.
     const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 3600000);
     const nextRetry = Date.now() + delay;
 
-    // Update server status
-    const newTarget: FederationTarget = {
+    await this.ctx.storage.put(`server:${destination}`, {
       serverName: destination,
       lastContact: target?.lastContact || 0,
       retryCount,
       nextRetry,
-    };
-    await this.ctx.storage.put(`server:${destination}`, newTarget);
+    } satisfies FederationTarget);
 
-    // Update events with retry count
-    for (const event of events) {
-      event.retry_count = retryCount;
-      await this.ctx.storage.put(`queue:${destination}:${event.event_id}`, event);
-    }
-
-    // Set alarm for retry
     await this.ctx.storage.setAlarm(nextRetry);
   }
 
   async alarm(): Promise<void> {
-    // Process all destinations with pending retries
     const allKeys = await this.ctx.storage.list({ prefix: 'server:' });
 
     for (const [, value] of allKeys) {

@@ -513,15 +513,28 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       continue;
     }
 
-    const state = await getRoomState(c.env.DB, roomId);
+    // Remote invites carry their stripped state on the membership row; local
+    // invites have none, so it is derived from the room's current state.
+    let strippedState: Array<{ type: string; state_key: string; content: any; sender: string }>;
+    const storedInvite = await c.env.DB.prepare(
+      `SELECT invite_state FROM room_memberships WHERE room_id = ? AND user_id = ?`
+    ).bind(roomId, userId).first<{ invite_state: string | null }>();
 
-    // Strip state for invited rooms
-    let strippedState = state.map(event => ({
-      type: event.type,
-      state_key: event.state_key!,
-      content: event.content,
-      sender: event.sender,
-    }));
+    if (storedInvite?.invite_state) {
+      try {
+        strippedState = JSON.parse(storedInvite.invite_state);
+      } catch {
+        strippedState = [];
+      }
+    } else {
+      const state = await getRoomState(c.env.DB, roomId);
+      strippedState = state.map(event => ({
+        type: event.type,
+        state_key: event.state_key!,
+        content: event.content,
+        sender: event.sender,
+      }));
+    }
 
     // Apply state filter to invited room state
     strippedState = applyEventFilter(strippedState, filter?.room?.state);

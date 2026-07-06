@@ -1,7 +1,8 @@
 // Matrix Server-Server (Federation) API endpoints
 
 import { Hono } from 'hono';
-import type { AppEnv, PDU } from '../types';
+import type { Context } from 'hono';
+import type { AppEnv, PDU, Env, Membership } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
@@ -10,18 +11,185 @@ import {
   verifyRemoteSignature,
   type ServerKeyResponse,
 } from '../services/federation-keys';
+import { sendPduToServers, getRemoteServersInRoom } from '../services/federation-sender';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
-import { getRoomState } from '../services/database';
+import {
+  getRoomState,
+  storeEvent,
+  updateMembership,
+  notifyUsersOfEvent,
+} from '../services/database';
 import { resolveState } from '../services/state-resolution';
+import { computeEventId, signEventForFederation, redactEvent } from '../utils/event-hashing';
+import { getRoomVersion } from '../services/room-versions';
+import { wakeSyncForUsers } from './to-device';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
 
+const VALID_MEMBERSHIPS: ReadonlySet<string> = new Set([
+  'join', 'invite', 'leave', 'ban', 'knock',
+]);
+
 const app = new Hono<AppEnv>();
 
-// GET /_matrix/federation/v1/version - Server version info (unauthenticated)
-// This must be defined BEFORE the auth middleware is applied
+// Converts a DB event row to a federation wire event: v3+ rooms omit event_id
+// (the receiver derives it from the reference hash) and carry hashes + signatures.
+function eventRowToWire(row: any, legacyIds: boolean): Record<string, unknown> {
+  const ev: Record<string, unknown> = {
+    room_id: row.room_id,
+    sender: row.sender,
+    type: row.event_type,
+    content: JSON.parse(row.content || '{}'),
+    origin_server_ts: row.origin_server_ts,
+    depth: row.depth,
+    auth_events: JSON.parse(row.auth_events || '[]'),
+    prev_events: JSON.parse(row.prev_events || '[]'),
+  };
+  if (row.state_key !== null && row.state_key !== undefined) {
+    ev.state_key = row.state_key;
+  }
+  if (row.hashes) ev.hashes = JSON.parse(row.hashes);
+  if (row.signatures) ev.signatures = JSON.parse(row.signatures);
+  if (legacyIds) ev.event_id = row.event_id;
+  return ev;
+}
+
+// Whether a room's version uses server-generated (v1/v2) event IDs that appear
+// on the wire, vs computed reference-hash IDs (v3+) that must be omitted.
+async function roomUsesLegacyIds(db: D1Database, roomId: string): Promise<boolean> {
+  const room = await db.prepare(
+    `SELECT room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_version: string }>();
+  return getRoomVersion(room?.room_version ?? '10')?.eventIdFormat === 'v1';
+}
+
+// Atomically allocate the next 'to_device' stream position. Mirrors the helper
+// in api/to-device.ts (which is not exported) so inbound m.direct_to_device
+// EDUs share the same ordering stream local clients read from.
+async function getNextToDeviceStreamPosition(db: D1Database): Promise<number> {
+  const result = await db.prepare(`
+    UPDATE stream_positions SET position = position + 1
+    WHERE stream_name = 'to_device' RETURNING position
+  `).first<{ position: number }>();
+  if (result) return result.position;
+
+  const upsert = await db.prepare(`
+    INSERT INTO stream_positions (stream_name, position) VALUES ('to_device', 1)
+    ON CONFLICT (stream_name) DO UPDATE SET position = position + 1
+    RETURNING position
+  `).first<{ position: number }>();
+  return upsert?.position ?? 1;
+}
+
+// Persists an inbound m.direct_to_device EDU for local recipients, fanning '*'
+// out to every device of a user and deduplicating by message_id.
+async function storeInboundToDevice(
+  env: Env,
+  origin: string,
+  content: any,
+  recipientsToWake: Set<string>
+): Promise<void> {
+  const sender: string = content?.sender || origin;
+  const messageType: string | undefined = content?.type;
+  const messageId: string | undefined = content?.message_id;
+  const messages = content?.messages;
+  if (!messageType || !messageId || !messages || typeof messages !== 'object') {
+    return;
+  }
+
+  for (const [recipientUserId, deviceMap] of Object.entries(messages)) {
+    if (recipientUserId.split(':')[1] !== env.SERVER_NAME) continue;
+    if (!deviceMap || typeof deviceMap !== 'object') continue;
+
+    let delivered = false;
+    for (const [deviceId, msgContent] of Object.entries(deviceMap as Record<string, any>)) {
+      let targetDevices: string[];
+      if (deviceId === '*') {
+        const rows = await env.DB.prepare(
+          `SELECT device_id FROM devices WHERE user_id = ?`
+        ).bind(recipientUserId).all<{ device_id: string }>();
+        targetDevices = rows.results.map((r) => r.device_id);
+      } else {
+        targetDevices = [deviceId];
+      }
+
+      for (const targetDeviceId of targetDevices) {
+        const streamPosition = await getNextToDeviceStreamPosition(env.DB);
+        await env.DB.prepare(`
+          INSERT INTO to_device_messages (
+            recipient_user_id, recipient_device_id, sender_user_id,
+            event_type, content, message_id, stream_position
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT (recipient_user_id, recipient_device_id, message_id) DO NOTHING
+        `).bind(
+          recipientUserId,
+          targetDeviceId,
+          sender,
+          messageType,
+          JSON.stringify(msgContent),
+          messageId,
+          streamPosition
+        ).run();
+        delivered = true;
+      }
+    }
+    if (delivered) recipientsToWake.add(recipientUserId);
+  }
+}
+
+// Persists an inbound invite as a membership row plus stripped state on
+// room_memberships.invite_state, which the /sync invite builders read.
+async function storeInboundInvite(
+  db: D1Database,
+  roomId: string,
+  roomVersion: string,
+  invitedUserId: string,
+  eventId: string,
+  inviteEvent: any,
+  inviteRoomState: any[] | undefined
+): Promise<void> {
+  // room_memberships has a FOREIGN KEY to rooms(room_id), so the remote room
+  // needs a stub row first. The join path inserts its rooms row with INSERT OR
+  // IGNORE, so this stub's room_version survives and has to be correct.
+  await db.prepare(
+    `INSERT OR IGNORE INTO rooms (room_id, room_version, is_public) VALUES (?, ?, 0)`
+  ).bind(roomId, roomVersion).run();
+
+  // Build stripped state keyed by (type, state_key) so duplicates collapse and
+  // the invite membership event always wins over any copy in invite_room_state.
+  const stripped = new Map<string, any>();
+  for (const e of inviteRoomState || []) {
+    if (!e || typeof e.type !== 'string') continue;
+    const stateKey = typeof e.state_key === 'string' ? e.state_key : '';
+    stripped.set(`${e.type}|${stateKey}`, {
+      type: e.type,
+      state_key: stateKey,
+      content: e.content ?? {},
+      sender: e.sender,
+    });
+  }
+  // Element needs the invitee's own m.room.member to render "you were invited".
+  stripped.set(`m.room.member|${invitedUserId}`, {
+    type: 'm.room.member',
+    state_key: invitedUserId,
+    content: inviteEvent?.content ?? { membership: 'invite' },
+    sender: inviteEvent?.sender,
+  });
+
+  const inviteStateJson = JSON.stringify([...stripped.values()]);
+
+  // updateMembership does INSERT OR REPLACE and does not carry invite_state, so
+  // the UPDATE has to run after it.
+  await updateMembership(db, roomId, invitedUserId, 'invite', eventId);
+  await db.prepare(
+    `UPDATE room_memberships SET invite_state = ? WHERE room_id = ? AND user_id = ?`
+  ).bind(inviteStateJson, roomId, invitedUserId).run();
+}
+
+// GET /_matrix/federation/v1/version - Server version info, declared before the
+// auth middleware below so it stays unauthenticated
 app.get('/_matrix/federation/v1/version', async (c) => {
   return c.json({
     server: {
@@ -31,16 +199,15 @@ app.get('/_matrix/federation/v1/version', async (c) => {
   });
 });
 
-// Apply federation authentication to all other federation v1 endpoints
-// Key endpoints (/_matrix/key/*) remain unauthenticated as they are used to establish trust
-// Version endpoint is also unauthenticated as it's used for initial contact
+// /_matrix/key/* stays unauthenticated: it is how servers establish trust
 app.use('/_matrix/federation/v1/*', requireFederationAuth());
+// v2 endpoints (invite, send_join, send_leave) need the same authentication
+app.use('/_matrix/federation/v2/*', requireFederationAuth());
 
 // GET /_matrix/key/v2/server - Get server signing keys
 app.get('/_matrix/key/v2/server', async (c) => {
   const serverName = c.env.SERVER_NAME;
 
-  // Get or create server signing keys (prefer v2 keys with proper Ed25519)
   let keys = await c.env.DB.prepare(
     `SELECT key_id, public_key, private_key_jwk, key_version, valid_from, valid_until
      FROM server_keys WHERE is_current = 1 ORDER BY key_version DESC`
@@ -484,16 +651,72 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   // Process incoming PDUs (Persistent Data Units - events)
   for (const pdu of pdus || []) {
     try {
-      const eventId = pdu.event_id;
       const roomId = pdu.room_id;
 
-      // Check if we've already processed this PDU
+      // event_id is deliberately not required: v3+ PDUs arrive without one since
+      // it is the reference hash of the redacted event, computed below.
+      if (!roomId || !pdu.sender || !pdu.type || pdu.content === undefined || pdu.content === null) {
+        pduResults[pdu.event_id || 'unknown'] = {
+          error: 'Invalid PDU structure',
+        };
+        continue;
+      }
+
+      const pduOrigin = (pdu.sender as string).split(':')[1];
+      if (!pduOrigin) {
+        pduResults[pdu.event_id || 'unknown'] = { error: 'Invalid sender format' };
+        continue;
+      }
+
+      // The room version drives event_id computation for v3+ and the auth check.
+      const room = await c.env.DB.prepare(
+        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+      ).bind(roomId).first<{ room_id: string; room_version: string }>();
+
+      // Unknown room: acknowledge without storing. Federation only sends events
+      // for rooms we are in, so this is out-of-order delivery or a room we left.
+      if (!room) {
+        pduResults[pdu.event_id || 'unknown'] = {};
+        continue;
+      }
+
+      // Canonical event_id: v1/v2 carry it on the wire, but for v3+ it is the
+      // reference hash, so compute it here and reject a PDU claiming a different
+      // id rather than trusting the sender.
+      let eventId: string;
+      const idFormat = getRoomVersion(room.room_version)?.eventIdFormat ?? 'v4';
+      if (idFormat === 'v1') {
+        if (!pdu.event_id) {
+          pduResults['unknown'] = { error: 'Missing event_id for v1/v2 room' };
+          continue;
+        }
+        eventId = pdu.event_id;
+      } else {
+        let computedId: string;
+        try {
+          computedId = await computeEventId(pdu, room.room_version);
+        } catch (idErr: any) {
+          pduResults[pdu.event_id || 'unknown'] = {
+            error: `Failed to compute event id: ${idErr?.message || 'unknown error'}`,
+          };
+          continue;
+        }
+        if (pdu.event_id && pdu.event_id !== computedId) {
+          pduResults[pdu.event_id] = { error: 'Event ID does not match computed reference hash' };
+          await c.env.DB.prepare(
+            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+             VALUES (?, ?, ?, ?, 0, ?)`
+          ).bind(pdu.event_id, pduOrigin, roomId, Date.now(), 'Event ID mismatch').run();
+          continue;
+        }
+        eventId = computedId;
+      }
+
       const existingPdu = await c.env.DB.prepare(
         `SELECT accepted, rejection_reason FROM processed_pdus WHERE event_id = ?`
       ).bind(eventId).first<{ accepted: number; rejection_reason: string | null }>();
 
       if (existingPdu) {
-        // Already processed
         if (existingPdu.accepted) {
           pduResults[eventId] = {};
         } else {
@@ -504,24 +727,13 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         continue;
       }
 
-      // Validate basic PDU structure
-      if (!eventId || !roomId || !pdu.sender || !pdu.type || !pdu.content) {
-        pduResults[eventId || 'unknown'] = {
-          error: 'Invalid PDU structure',
-        };
-        continue;
-      }
-
-      // Get the origin server from the sender
-      const pduOrigin = (pdu.sender as string).split(':')[1];
-      if (!pduOrigin) {
-        pduResults[eventId] = { error: 'Invalid sender format' };
-        continue;
-      }
-
-      // Verify PDU signatures
+      // Signatures are computed over the redacted event; every PDU must carry one.
+      let signatureValid = false;
       if (pdu.signatures) {
-        let signatureValid = false;
+        const redactedForVerify = redactEvent(pdu, room.room_version);
+        // v3+ wire events carry no event_id, so keep a locally attached one out
+        // of the verified material.
+        delete redactedForVerify.event_id;
         const signatories = Object.keys(pdu.signatures);
 
         for (const signatory of signatories) {
@@ -529,7 +741,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           for (const keyId of keyIds) {
             try {
               const isValid = await verifyRemoteSignature(
-                pdu,
+                redactedForVerify,
                 signatory,
                 keyId,
                 c.env.DB,
@@ -545,16 +757,15 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           }
           if (signatureValid) break;
         }
+      }
 
-        if (!signatureValid && pduOrigin !== origin) {
-          // PDU from third party without valid signature
-          pduResults[eventId] = { error: 'Invalid signature' };
-          await c.env.DB.prepare(
-            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-             VALUES (?, ?, ?, ?, 0, ?)`
-          ).bind(eventId, pduOrigin, roomId, Date.now(), 'Invalid signature').run();
-          continue;
-        }
+      if (!signatureValid) {
+        pduResults[eventId] = { error: 'Invalid signature' };
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 0, ?)`
+        ).bind(eventId, pduOrigin, roomId, Date.now(), 'Invalid signature').run();
+        continue;
       }
 
       if (pdu.hashes?.sha256) {
@@ -573,107 +784,92 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Check if the room exists locally
-      const room = await c.env.DB.prepare(
-        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-      // Run event authorization check if we have room state
-      if (room) {
-        try {
-          const roomState = await getRoomState(c.env.DB, roomId);
-          const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
-          if (!authResult.allowed) {
-            pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
-            await c.env.DB.prepare(
-              `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-               VALUES (?, ?, ?, ?, 0, ?)`
-            ).bind(eventId, pduOrigin, roomId, Date.now(), authResult.error || 'Auth failed').run();
-            continue;
-          }
-        } catch (authErr) {
-          console.warn(`[federation] Auth check failed for ${eventId}, accepting anyway:`, authErr);
+      try {
+        const roomState = await getRoomState(c.env.DB, roomId);
+        const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
+        if (!authResult.allowed) {
+          pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
+          await c.env.DB.prepare(
+            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+             VALUES (?, ?, ?, ?, 0, ?)`
+          ).bind(eventId, pduOrigin, roomId, Date.now(), authResult.error || 'Auth failed').run();
+          continue;
         }
+      } catch (authErr) {
+        console.warn(`[federation] Auth check failed for ${eventId}, accepting anyway:`, authErr);
       }
 
-      // Accept the PDU
       pduResults[eventId] = {};
 
-      // Record that we processed this PDU
       await c.env.DB.prepare(
         `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
          VALUES (?, ?, ?, ?, 1, NULL)`
       ).bind(eventId, pduOrigin, roomId, Date.now()).run();
 
-      // If room exists, store the event
-      if (room) {
-        try {
-          await c.env.DB.prepare(
-            `INSERT OR IGNORE INTO events
-             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            eventId,
-            roomId,
-            pdu.sender,
-            pdu.type,
-            pdu.state_key ?? null,
-            JSON.stringify(pdu.content),
-            pdu.origin_server_ts,
-            pdu.depth || 0,
-            JSON.stringify(pdu.auth_events || []),
-            JSON.stringify(pdu.prev_events || []),
-            pdu.hashes ? JSON.stringify(pdu.hashes) : null,
-            pdu.signatures ? JSON.stringify(pdu.signatures) : null
-          ).run();
+      // storeEvent assigns the stream_ordering that incremental /sync needs, and
+      // updates current room state for state events.
+      try {
+        const storedEvent: PDU = {
+          event_id: eventId,
+          room_id: roomId,
+          sender: pdu.sender,
+          type: pdu.type,
+          state_key: pdu.state_key,
+          content: pdu.content,
+          origin_server_ts: pdu.origin_server_ts,
+          unsigned: pdu.unsigned,
+          depth: pdu.depth || 0,
+          auth_events: pdu.auth_events || [],
+          prev_events: pdu.prev_events || [],
+          hashes: pdu.hashes,
+          signatures: pdu.signatures,
+        };
+        await storeEvent(c.env.DB, storedEvent);
 
-          // Update room state
-          if (pdu.state_key !== undefined) {
-            // If the PDU has multiple prev_events, we may need state resolution
-            const prevEvents = pdu.prev_events || [];
-            if (prevEvents.length > 1 && room) {
-              try {
-                // Fetch current room state and resolve with new event
-                const currentState = await getRoomState(c.env.DB, roomId);
-                const newEvent: PDU = {
-                  event_id: eventId,
-                  room_id: roomId,
-                  sender: pdu.sender,
-                  type: pdu.type,
-                  state_key: pdu.state_key,
-                  content: pdu.content,
-                  origin_server_ts: pdu.origin_server_ts,
-                  depth: pdu.depth || 0,
-                  auth_events: pdu.auth_events || [],
-                  prev_events: prevEvents,
-                };
-                const resolved = resolveState(room.room_version, [currentState, [newEvent]]);
-                // Apply resolved state
-                for (const stateEvent of resolved) {
-                  if (stateEvent.state_key !== undefined) {
-                    await c.env.DB.prepare(
-                      `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                       VALUES (?, ?, ?, ?)`
-                    ).bind(roomId, stateEvent.type, stateEvent.state_key, stateEvent.event_id).run();
-                  }
+        if (pdu.state_key !== undefined) {
+          // If the PDU forks history (multiple prev_events), run state resolution
+          // to pick the authoritative event for each (type, state_key). storeEvent
+          // has already applied a last-writer-wins update, which this overrides.
+          const prevEvents = pdu.prev_events || [];
+          if (prevEvents.length > 1) {
+            try {
+              const currentState = await getRoomState(c.env.DB, roomId);
+              const resolved = resolveState(room.room_version, [currentState, [storedEvent]]);
+              for (const stateEvent of resolved) {
+                if (stateEvent.state_key !== undefined) {
+                  await c.env.DB.prepare(
+                    `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+                     VALUES (?, ?, ?, ?)`
+                  ).bind(roomId, stateEvent.type, stateEvent.state_key, stateEvent.event_id).run();
                 }
-              } catch (resolveErr) {
-                console.warn(`[federation] State resolution failed for ${eventId}, falling back:`, resolveErr);
-                await c.env.DB.prepare(
-                  `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                   VALUES (?, ?, ?, ?)`
-                ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
               }
-            } else {
-              await c.env.DB.prepare(
-                `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
-                 VALUES (?, ?, ?, ?)`
-              ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
+            } catch (resolveErr) {
+              console.warn(`[federation] State resolution failed for ${eventId}, keeping last-writer state:`, resolveErr);
             }
           }
-        } catch (e) {
-          console.error(`Failed to store event ${eventId}:`, e);
+
+          // Mirror remote membership changes so local queries and sync see them.
+          if (pdu.type === 'm.room.member' && typeof pdu.state_key === 'string') {
+            const membership = pdu.content?.membership;
+            if (typeof membership === 'string' && VALID_MEMBERSHIPS.has(membership)) {
+              await updateMembership(
+                c.env.DB,
+                roomId,
+                pdu.state_key,
+                membership as Membership,
+                eventId,
+                pdu.content?.displayname,
+                pdu.content?.avatar_url
+              );
+            }
+          }
         }
+
+        // Wake local /sync long-polls after responding: the transaction ack gates
+        // how fast the origin sends the next one, so don't block it on DO fan-out.
+        c.executionCtx.waitUntil(notifyUsersOfEvent(c.env, roomId, eventId, pdu.type));
+      } catch (e) {
+        console.error(`Failed to store event ${eventId}:`, e);
       }
     } catch (e: any) {
       const eventId = pdu?.event_id || 'unknown';
@@ -692,6 +888,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   }
 
   // Process EDUs (Ephemeral Data Units)
+  const toDeviceRecipients = new Set<string>();
   for (const edu of edus || []) {
     try {
       const eduType = edu.edu_type;
@@ -790,19 +987,19 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
 
         case 'm.receipt':
-          // Handle read receipts
+          // Inbound read receipts are not applied yet
           break;
 
         case 'm.direct_to_device':
-          // Handle to-device messages
+          // Store to-device messages for local recipients so /sync delivers them.
+          await storeInboundToDevice(c.env, origin, content, toDeviceRecipients);
           break;
 
         case 'm.signing_key_update':
-          // Handle cross-signing key updates
+          // Inbound cross-signing key updates are not applied yet
           break;
 
         default:
-          // Unknown EDU type - log and continue
           console.log(`Received unknown EDU type: ${eduType}`);
       }
 
@@ -817,9 +1014,14 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
     }
   }
 
+  // Wake to-device recipients so their /sync returns before the poll timeout.
+  if (toDeviceRecipients.size > 0) {
+    c.executionCtx.waitUntil(wakeSyncForUsers(c.env, toDeviceRecipients));
+  }
+
   const response = { pdus: pduResults };
 
-  // Store transaction for idempotency
+  // Cache the response so a retried transaction returns the same result
   await c.env.DB.prepare(
     `INSERT OR REPLACE INTO federation_transactions (txn_id, origin, received_at, response)
      VALUES (?, ?, ?, ?)`
@@ -855,92 +1057,56 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
     return Errors.notFound('Event not found').toResponse();
   }
 
-  const pdu: PDU = {
-    event_id: event.event_id,
-    room_id: event.room_id,
-    sender: event.sender,
-    type: event.event_type,
-    state_key: event.state_key ?? undefined,
-    content: JSON.parse(event.content),
-    origin_server_ts: event.origin_server_ts,
-    depth: event.depth,
-    auth_events: JSON.parse(event.auth_events),
-    prev_events: JSON.parse(event.prev_events),
-    hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
-    signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
-  };
-
+  const legacyIds = await roomUsesLegacyIds(c.env.DB, event.room_id);
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
-    pdus: [pdu],
+    pdus: [eventRowToWire(event, legacyIds)],
   });
 });
 
 // GET /_matrix/federation/v1/state/:roomId - Get room state
 app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
-  // Note: eventId could be used to get state at a specific point in time
+  // State at a specific event is not implemented; current state is returned
   void c.req.query('event_id');
 
-  // Get current room state
+  const legacyIds = await roomUsesLegacyIds(c.env.DB, roomId);
+
+  // Full rows so hashes/signatures make it into the wire events
   const stateEvents = await c.env.DB.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ?`
-  ).bind(roomId).all<{
-    event_id: string;
-    room_id: string;
-    sender: string;
-    event_type: string;
-    state_key: string | null;
-    content: string;
-    origin_server_ts: number;
-    depth: number;
-    auth_events: string;
-    prev_events: string;
-  }>();
+  ).bind(roomId).all();
 
-  const pdus = stateEvents.results.map(e => ({
-    event_id: e.event_id,
-    room_id: e.room_id,
-    sender: e.sender,
-    type: e.event_type,
-    state_key: e.state_key ?? '',
-    content: JSON.parse(e.content),
-    origin_server_ts: e.origin_server_ts,
-    depth: e.depth,
-    auth_events: JSON.parse(e.auth_events),
-    prev_events: JSON.parse(e.prev_events),
-  }));
+  const pdus = (stateEvents.results as any[]).map(e => eventRowToWire(e, legacyIds));
 
-  // Get auth chain
-  const authEventIds = new Set<string>();
-  for (const pdu of pdus) {
-    for (const authId of pdu.auth_events) {
-      authEventIds.add(authId);
-    }
+  // Recursive auth chain closure over the state events' auth_events
+  const seen = new Set<string>();
+  const authChain: Record<string, unknown>[] = [];
+  let frontier: string[] = [];
+  for (const e of stateEvents.results as any[]) {
+    frontier.push(...JSON.parse(e.auth_events || '[]'));
   }
-
-  const authChain: any[] = [];
-  for (const authId of authEventIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        ...authEvent,
-        type: (authEvent as any).event_type,
-        content: JSON.parse((authEvent as any).content),
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-      });
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const authId of frontier) {
+      if (seen.has(authId)) continue;
+      seen.add(authId);
+      const authEvent = await c.env.DB.prepare(
+        `SELECT event_id, room_id, sender, event_type, state_key, content,
+         origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+         FROM events WHERE event_id = ?`
+      ).bind(authId).first();
+      if (authEvent) {
+        authChain.push(eventRowToWire(authEvent, legacyIds));
+        next.push(...JSON.parse((authEvent as any).auth_events || '[]'));
+      }
     }
+    frontier = next;
   }
 
   return c.json({
@@ -1033,8 +1199,9 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
     return Errors.notFound('Event not found').toResponse();
   }
 
-  // Build auth chain by recursively collecting auth events
-  const authChain: PDU[] = [];
+  // Build auth chain by recursively collecting auth events (wire format)
+  const legacyIds = await roomUsesLegacyIds(c.env.DB, roomId);
+  const authChain: Record<string, unknown>[] = [];
   const visited = new Set<string>();
   const toProcess = JSON.parse(event.auth_events) as string[];
 
@@ -1047,40 +1214,11 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
       `SELECT event_id, room_id, sender, event_type, state_key, content,
        origin_server_ts, depth, auth_events, prev_events, hashes, signatures
        FROM events WHERE event_id = ?`
-    ).bind(authId).first<{
-      event_id: string;
-      room_id: string;
-      sender: string;
-      event_type: string;
-      state_key: string | null;
-      content: string;
-      origin_server_ts: number;
-      depth: number;
-      auth_events: string;
-      prev_events: string;
-      hashes: string | null;
-      signatures: string | null;
-    }>();
+    ).bind(authId).first();
 
     if (authEvent) {
-      authChain.push({
-        event_id: authEvent.event_id,
-        room_id: authEvent.room_id,
-        sender: authEvent.sender,
-        type: authEvent.event_type,
-        state_key: authEvent.state_key ?? undefined,
-        content: JSON.parse(authEvent.content),
-        origin_server_ts: authEvent.origin_server_ts,
-        depth: authEvent.depth,
-        auth_events: JSON.parse(authEvent.auth_events),
-        prev_events: JSON.parse(authEvent.prev_events),
-        hashes: authEvent.hashes ? JSON.parse(authEvent.hashes) : undefined,
-        signatures: authEvent.signatures ? JSON.parse(authEvent.signatures) : undefined,
-      });
-
-      // Add this event's auth_events to process
-      const moreAuthEvents = JSON.parse(authEvent.auth_events) as string[];
-      for (const id of moreAuthEvents) {
+      authChain.push(eventRowToWire(authEvent, legacyIds));
+      for (const id of JSON.parse((authEvent as any).auth_events || '[]') as string[]) {
         if (!visited.has(id)) {
           toProcess.push(id);
         }
@@ -1137,20 +1275,8 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     ).bind(roomId, limit).all()).results;
   }
 
-  const pdus = events.map((e: any) => ({
-    event_id: e.event_id,
-    room_id: e.room_id,
-    sender: e.sender,
-    type: e.event_type,
-    state_key: e.state_key ?? undefined,
-    content: JSON.parse(e.content),
-    origin_server_ts: e.origin_server_ts,
-    depth: e.depth,
-    auth_events: JSON.parse(e.auth_events),
-    prev_events: JSON.parse(e.prev_events),
-    hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-    signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-  }));
+  const backfillLegacyIds = await roomUsesLegacyIds(c.env.DB, roomId);
+  const pdus = events.map((e: any) => eventRowToWire(e, backfillLegacyIds));
 
   return c.json({
     origin: c.env.SERVER_NAME,
@@ -1190,6 +1316,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   }
 
   // Walk backwards from latest_events to earliest_events
+  const missingLegacyIds = await roomUsesLegacyIds(c.env.DB, roomId);
   const events: any[] = [];
   const visited = new Set<string>(earliestEvents);
   const toProcess = [...latestEvents];
@@ -1204,38 +1331,12 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
        origin_server_ts, depth, auth_events, prev_events, hashes, signatures
        FROM events
        WHERE event_id = ? AND room_id = ? AND depth >= ?`
-    ).bind(eventId, roomId, minDepth).first<{
-      event_id: string;
-      room_id: string;
-      sender: string;
-      event_type: string;
-      state_key: string | null;
-      content: string;
-      origin_server_ts: number;
-      depth: number;
-      auth_events: string;
-      prev_events: string;
-      hashes: string | null;
-      signatures: string | null;
-    }>();
+    ).bind(eventId, roomId, minDepth).first();
 
     if (event) {
-      events.push({
-        event_id: event.event_id,
-        room_id: event.room_id,
-        sender: event.sender,
-        type: event.event_type,
-        state_key: event.state_key ?? undefined,
-        content: JSON.parse(event.content),
-        origin_server_ts: event.origin_server_ts,
-        depth: event.depth,
-        auth_events: JSON.parse(event.auth_events),
-        prev_events: JSON.parse(event.prev_events),
-        hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
-        signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
-      });
+      events.push(eventRowToWire(event, missingLegacyIds));
 
-      const prevEvents = JSON.parse(event.prev_events) as string[];
+      const prevEvents = JSON.parse((event as any).prev_events || '[]') as string[];
       for (const prevId of prevEvents) {
         if (!visited.has(prevId)) {
           toProcess.push(prevId);
@@ -1281,10 +1382,20 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
      WHERE rs.room_id = ? AND rs.event_type = 'm.room.power_levels'`
   ).bind(roomId).first<{ event_id: string }>();
 
+  // The joining user's current membership (the invite) belongs in auth_events:
+  // the join auth rule looks for a prior invite here, so without it a join into
+  // an invite-only room cannot be authorized by the resident server.
+  const memberEvent = await c.env.DB.prepare(
+    `SELECT e.event_id FROM room_state rs
+     JOIN events e ON rs.event_id = e.event_id
+     WHERE rs.room_id = ? AND rs.event_type = 'm.room.member' AND rs.state_key = ?`
+  ).bind(roomId, userId).first<{ event_id: string }>();
+
   const authEvents: string[] = [];
   if (createEvent) authEvents.push(createEvent.event_id);
-  if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
+  if (memberEvent) authEvents.push(memberEvent.event_id);
 
   // Get latest event for prev_events
   const latestEvent = await c.env.DB.prepare(
@@ -1315,195 +1426,201 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   });
 });
 
-// PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join
-app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
+// Shared send_join implementation (v1 + v2): validates the remote user's join
+// event, persists it, fans it out to the other servers in the room, and returns
+// current room state plus the full recursive auth chain in wire format.
+async function processSendJoin(
+  c: Context<AppEnv>,
+  roomId: string,
+  eventId: string
+): Promise<Response | Record<string, unknown>> {
+  let joinEvent: any;
   try {
-    body = await c.req.json();
+    joinEvent = await c.req.json();
   } catch {
     return Errors.badJson().toResponse();
   }
 
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Get current state and auth chain
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.* FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all();
-
-  // Build auth chain
-  const authChainIds = new Set<string>();
-  for (const event of stateEvents.results) {
-    const authEvents = JSON.parse((event as any).auth_events) as string[];
-    for (const authId of authEvents) {
-      authChainIds.add(authId);
-    }
-  }
-
-  const authChain: any[] = [];
-  for (const authId of authChainIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        event_id: (authEvent as any).event_id,
-        room_id: (authEvent as any).room_id,
-        sender: (authEvent as any).sender,
-        type: (authEvent as any).event_type,
-        state_key: (authEvent as any).state_key ?? undefined,
-        content: JSON.parse((authEvent as any).content),
-        origin_server_ts: (authEvent as any).origin_server_ts,
-        depth: (authEvent as any).depth,
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
-        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
-      });
-    }
-  }
-
-  return c.json({
-    origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
-      event_id: e.event_id,
-      room_id: e.room_id,
-      sender: e.sender,
-      type: e.event_type,
-      state_key: e.state_key ?? undefined,
-      content: JSON.parse(e.content),
-      origin_server_ts: e.origin_server_ts,
-      depth: e.depth,
-      auth_events: JSON.parse(e.auth_events),
-      prev_events: JSON.parse(e.prev_events),
-      hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-      signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
-  });
-});
-
-// PUT /_matrix/federation/v2/send_join/:roomId/:eventId - Complete join (v2)
-// v2 wraps response in { event, state, auth_chain, ... } instead of returning array
-app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Get room info
-  const room = await c.env.DB.prepare(
+  const db = c.env.DB;
+  const room = await db.prepare(
     `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Get current state and auth chain
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.* FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
+  const stateKey = joinEvent?.state_key;
+  if (
+    joinEvent?.type !== 'm.room.member' ||
+    joinEvent?.content?.membership !== 'join' ||
+    typeof stateKey !== 'string' ||
+    stateKey !== joinEvent?.sender ||
+    joinEvent?.room_id !== roomId
+  ) {
+    return c.json({ errcode: 'M_INVALID_PARAM', error: 'Not a valid join event for this room' }, 400);
+  }
+
+  const behavior = getRoomVersion(room.room_version);
+  const legacyIds = behavior?.eventIdFormat === 'v1';
+
+  // v3+ event IDs are derived from the redacted event, never from a claim
+  if (legacyIds) {
+    if (joinEvent.event_id !== eventId) {
+      return c.json({ errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' }, 400);
+    }
+  } else {
+    const computedId = await computeEventId(joinEvent, room.room_version);
+    if (computedId !== eventId) {
+      return c.json({ errcode: 'M_INVALID_PARAM', error: 'Event ID does not match reference hash' }, 400);
+    }
+  }
+
+  // Verify the joining server's signature (over the redacted event, per spec)
+  const senderServer = stateKey.split(':').slice(1).join(':');
+  const redactedForVerify = redactEvent(joinEvent, room.room_version);
+  delete redactedForVerify.event_id;
+  let signatureValid = false;
+  for (const keyId of Object.keys(joinEvent.signatures?.[senderServer] ?? {})) {
+    try {
+      if (await verifyRemoteSignature(redactedForVerify, senderServer, keyId, db, c.env.CACHE)) {
+        signatureValid = true;
+        break;
+      }
+    } catch (e) {
+      console.warn('[send_join] signature check failed:', e);
+    }
+  }
+  if (!signatureValid) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: 'Join event signature verification failed' }, 403);
+  }
+
+  // Authorization: public rooms, or an existing invite/join for the user
+  // (restricted-join validation is not yet implemented - treated like invite)
+  const joinRuleRow = await db.prepare(
+    `SELECT e.content FROM room_state rs JOIN events e ON rs.event_id = e.event_id
+     WHERE rs.room_id = ? AND rs.event_type = 'm.room.join_rules' AND rs.state_key = ''`
+  ).bind(roomId).first<{ content: string }>();
+  let joinRule = 'invite';
+  try {
+    joinRule = JSON.parse(joinRuleRow?.content ?? '{}').join_rule ?? 'invite';
+  } catch {
+    // Malformed join_rules content - keep the restrictive default
+  }
+  if (joinRule !== 'public') {
+    const existing = await db.prepare(
+      `SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`
+    ).bind(roomId, stateKey).first<{ membership: string }>();
+    if (!existing || (existing.membership !== 'invite' && existing.membership !== 'join')) {
+      return c.json({ errcode: 'M_FORBIDDEN', error: 'User is not invited to this room' }, 403);
+    }
+  }
+
+  // The joining server authors and signs this event; the resident server only
+  // adds its own signature for restricted rooms (join_authorised_via_users_server).
+  // `unsigned` is local metadata and does not belong on a federated PDU.
+  const wireJoinEvent: Record<string, unknown> = { ...joinEvent };
+  delete wireJoinEvent.unsigned;
+  delete wireJoinEvent.event_id;
+
+  // DB row -> wire-format event (v3+ wire events carry no event_id)
+  const toWire = (row: any): Record<string, unknown> => {
+    const ev: Record<string, unknown> = {
+      room_id: row.room_id,
+      sender: row.sender,
+      type: row.event_type,
+      content: JSON.parse(row.content || '{}'),
+      origin_server_ts: row.origin_server_ts,
+      depth: row.depth,
+      auth_events: JSON.parse(row.auth_events || '[]'),
+      prev_events: JSON.parse(row.prev_events || '[]'),
+    };
+    if (row.state_key !== null && row.state_key !== undefined) {
+      ev.state_key = row.state_key;
+    }
+    if (row.hashes) ev.hashes = JSON.parse(row.hashes);
+    if (row.signatures) ev.signatures = JSON.parse(row.signatures);
+    if (legacyIds) ev.event_id = row.event_id;
+    return ev;
+  };
+
+  // Current room state (prior to this join, per spec)
+  const stateRows = await db.prepare(
+    `SELECT e.* FROM room_state rs JOIN events e ON rs.event_id = e.event_id WHERE rs.room_id = ?`
   ).bind(roomId).all();
+  const stateWire = (stateRows.results as any[]).map(toWire);
 
-  // Build auth chain
-  const authChainIds = new Set<string>();
-  for (const event of stateEvents.results) {
-    const authEvents = JSON.parse((event as any).auth_events) as string[];
-    for (const authId of authEvents) {
-      authChainIds.add(authId);
-    }
+  // Auth chain: recursive closure over auth_events references
+  const seen = new Set<string>();
+  const authChainWire: Record<string, unknown>[] = [];
+  let frontier: string[] = [];
+  for (const r of stateRows.results as any[]) {
+    frontier.push(...JSON.parse(r.auth_events || '[]'));
   }
-
-  const authChain: any[] = [];
-  for (const authId of authChainIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      authChain.push({
-        event_id: (authEvent as any).event_id,
-        room_id: (authEvent as any).room_id,
-        sender: (authEvent as any).sender,
-        type: (authEvent as any).event_type,
-        state_key: (authEvent as any).state_key ?? undefined,
-        content: JSON.parse((authEvent as any).content),
-        origin_server_ts: (authEvent as any).origin_server_ts,
-        depth: (authEvent as any).depth,
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
-        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
-      });
-    }
-  }
-
-  // v2 returns servers_in_room for restricted joins
-  const serversInRoom = new Set<string>();
-  for (const event of stateEvents.results) {
-    if ((event as any).event_type === 'm.room.member') {
-      const content = JSON.parse((event as any).content);
-      if (content.membership === 'join') {
-        const sender = (event as any).sender as string;
-        const serverName = sender.split(':')[1];
-        if (serverName) serversInRoom.add(serverName);
+  frontier.push(...((joinEvent.auth_events as string[] | undefined) ?? []));
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const row = await db.prepare(`SELECT * FROM events WHERE event_id = ?`).bind(id).first();
+      if (row) {
+        authChainWire.push(toWire(row));
+        next.push(...JSON.parse((row as any).auth_events || '[]'));
       }
     }
+    frontier = next;
   }
 
-  return c.json({
+  // Persist the join with the sender's signature, update state + membership
+  const storedJoin: Record<string, unknown> = { ...joinEvent, event_id: eventId };
+  delete storedJoin.unsigned;
+  await storeEvent(db, storedJoin as unknown as PDU);
+  await db.prepare(
+    `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
+     VALUES (?, 'm.room.member', ?, ?)`
+  ).bind(roomId, stateKey, eventId).run();
+  await updateMembership(db, roomId, stateKey, 'join', eventId);
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  // For v1/v2 the wire event keeps event_id
+  const wireJoin: Record<string, unknown> = { ...wireJoinEvent };
+  if (legacyIds) wireJoin.event_id = eventId;
+
+  // Fan the join out to the other remote servers in the room
+  const remoteServers = await getRemoteServersInRoom(db, roomId, c.env.SERVER_NAME);
+  const others = remoteServers.filter(s => s !== senderServer);
+  if (others.length > 0) {
+    c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wireJoin, others));
+  }
+
+  return {
     origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
-      event_id: e.event_id,
-      room_id: e.room_id,
-      sender: e.sender,
-      type: e.event_type,
-      state_key: e.state_key ?? undefined,
-      content: JSON.parse(e.content),
-      origin_server_ts: e.origin_server_ts,
-      depth: e.depth,
-      auth_events: JSON.parse(e.auth_events),
-      prev_events: JSON.parse(e.prev_events),
-      hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
-      signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
-    members_omitted: false,
-    servers_in_room: Array.from(serversInRoom),
-  });
+    event: wireJoin,
+    state: stateWire,
+    auth_chain: authChainWire,
+    servers_in_room: [...new Set([c.env.SERVER_NAME, senderServer, ...remoteServers])],
+  };
+}
+
+// PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join
+app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
+  const result = await processSendJoin(c, c.req.param('roomId'), c.req.param('eventId'));
+  if (result instanceof Response) {
+    return result;
+  }
+  // v1 responds with the legacy [200, body] tuple
+  return c.json([200, result]);
+});
+
+// PUT /_matrix/federation/v2/send_join/:roomId/:eventId - Complete join (v2)
+// v2 wraps the response in an object instead of the legacy [200, body] tuple
+app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
+  const result = await processSendJoin(c, c.req.param('roomId'), c.req.param('eventId'));
+  if (result instanceof Response) {
+    return result;
+  }
+  // Always full state; omit_members is not implemented
+  return c.json({ ...result, members_omitted: false });
 });
 
 // GET /_matrix/federation/v1/make_leave/:roomId/:userId - Prepare leave request
@@ -1658,8 +1775,9 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
 // PUT /_matrix/federation/v1/invite/:roomId/:eventId - Receive invite (v1)
 // Used when a remote server invites a local user to a room
 app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
-  // roomId is available from route params but we validate from the event body
-  void c.req.param('roomId');
+  // The room is remote, so trust the room_id / event_id from the URL (v3+ invite
+  // events carry no event_id in the body).
+  const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
 
   let body: {
@@ -1728,22 +1846,32 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Sign the event
-  const signedEvent = await signJson(
+  // Sign over the redacted event so the signature validates on the inviting
+  // server. The v1 invite endpoint predates v3 rooms and carries no room_version,
+  // so default to '1', which applies the pre-v11 redaction rules v1/v2 expect.
+  const roomVersion = body.room_version || '1';
+  const signedEvent = await signEventForFederation(
     inviteEvent,
+    roomVersion,
     c.env.SERVER_NAME,
     key.key_id,
     JSON.parse(key.private_key_jwk)
   );
 
-  // v1 returns the signed event directly
-  return c.json([200, signedEvent]);
+  // Persist the invite so the local user sees it in /sync, then wake their sync.
+  const inviteRoomState = body.invite_room_state ?? inviteEvent.unsigned?.invite_room_state;
+  await storeInboundInvite(c.env.DB, roomId, roomVersion, stateKey, eventId, inviteEvent, inviteRoomState);
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, [stateKey]));
+
+  // v1 responds with [200, { event }] per the legacy federation spec.
+  return c.json([200, { event: signedEvent }]);
 });
 
 // PUT /_matrix/federation/v2/invite/:roomId/:eventId - Receive invite (v2)
 app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
-  // roomId is available from route params but we validate from the event body
-  void c.req.param('roomId');
+  // The room is remote, so trust the room_id / event_id from the URL (v3+ invite
+  // events carry no event_id in the body).
+  const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
 
   let body: {
@@ -1828,13 +1956,19 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Sign the event
-  const signedEvent = await signJson(
+  // Sign over the redacted event so the signature validates on the inviting server.
+  const signedEvent = await signEventForFederation(
     inviteEvent,
+    roomVersion,
     c.env.SERVER_NAME,
     key.key_id,
     JSON.parse(key.private_key_jwk)
   );
+
+  // Persist the invite so the local user sees it in /sync, then wake their sync.
+  const inviteRoomState = body.invite_room_state ?? inviteEvent.unsigned?.invite_room_state;
+  await storeInboundInvite(c.env.DB, roomId, roomVersion, stateKey, eventId, inviteEvent, inviteRoomState);
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, [stateKey]));
 
   return c.json({ event: signedEvent });
 });

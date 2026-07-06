@@ -1,13 +1,20 @@
 // Matrix room endpoints
 
 import { Hono } from 'hono';
-import type { AppEnv, RoomCreateContent, RoomMemberContent, PDU } from '../types';
+import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, formatRoomAlias } from '../utils/ids';
 import { invalidateRoomCache } from '../services/room-cache';
-import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
-import { calculateContentHash } from '../utils/crypto';
+import { isRoomVersionSupported, getDefaultRoomVersion, getRoomVersion } from '../services/room-versions';
+import { finalizeEvent } from '../utils/event-hashing';
+import { getServerSigningKey, federationPut } from '../services/federation-keys';
+import {
+  sendPduToServers,
+  getRemoteServersInRoom,
+  leaveRemoteRoom,
+  serverNameOf,
+} from '../services/federation-sender';
 import {
   createRoom,
   getRoom,
@@ -28,6 +35,136 @@ import {
 import type { JoinResult } from '../workflows';
 
 const app = new Hono<AppEnv>();
+
+interface FinalizedLocalEvent {
+  eventId: string;
+  // Signed event in wire format, ready to hand to a remote server.
+  wirePdu: Record<string, any>;
+  // Same signed event with the derived event_id and any local-only `unsigned` data.
+  storedEvent: PDU;
+}
+
+// Signs a locally-created event and derives its ID, without storing or federating it.
+async function finalizeLocalEvent(
+  env: Env,
+  event: Record<string, any>,
+  roomVersion: string
+): Promise<FinalizedLocalEvent> {
+  const signingKey = await getServerSigningKey(env.DB);
+  if (!signingKey) {
+    throw new Error('Server signing key not configured');
+  }
+
+  const behavior = getRoomVersion(roomVersion);
+  const legacyIds = behavior?.eventIdFormat === 'v1';
+
+  // `unsigned` is local-only and never part of the signed wire event.
+  const localUnsigned = event.unsigned;
+
+  const working: Record<string, any> = { ...event };
+  if (legacyIds) {
+    working.origin = env.SERVER_NAME;
+    if (typeof working.event_id !== 'string') {
+      working.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
+    }
+  }
+
+  const { event: signed, eventId } = await finalizeEvent(
+    working,
+    roomVersion,
+    env.SERVER_NAME,
+    signingKey.keyId,
+    signingKey.privateKeyJwk
+  );
+
+  // v3+ wire events carry no event_id; v1/v2 keep the server-generated one.
+  const wirePdu: Record<string, any> = { ...signed };
+  if (legacyIds) {
+    wirePdu.event_id = eventId;
+  }
+
+  const storedEvent = { ...signed, event_id: eventId } as PDU;
+  if (localUnsigned !== undefined) {
+    storedEvent.unsigned = localUnsigned;
+  }
+
+  return { eventId, wirePdu, storedEvent };
+}
+
+// Finalizes an event and stores it, returning its ID and the wire PDU to federate.
+async function finalizeAndStore(
+  env: Env,
+  event: Record<string, any>,
+  roomVersion: string
+): Promise<{ eventId: string; wirePdu: Record<string, any> }> {
+  const { eventId, wirePdu, storedEvent } = await finalizeLocalEvent(env, event, roomVersion);
+  await storeEvent(env.DB, storedEvent);
+  return { eventId, wirePdu };
+}
+
+// The room version for an existing room row (defaults to the current default).
+async function roomVersionOf(env: Env, roomId: string): Promise<string> {
+  const room = await getRoom(env.DB, roomId);
+  return room?.room_version ?? getDefaultRoomVersion();
+}
+
+// Server-part of a Matrix ID (@user:server / !room:server). Null if malformed.
+function serverPartOf(id: string): string | null {
+  const idx = id.indexOf(':');
+  return idx === -1 ? null : id.slice(idx + 1);
+}
+
+// Deep-merges federation signatures (server -> keyId -> sig).
+function mergeSignatures(
+  base: Record<string, Record<string, string>> | undefined,
+  incoming: Record<string, Record<string, string>> | undefined
+): Record<string, Record<string, string>> {
+  const result: Record<string, Record<string, string>> = { ...(base ?? {}) };
+  for (const [server, keys] of Object.entries(incoming ?? {})) {
+    result[server] = { ...(result[server] ?? {}), ...keys };
+  }
+  return result;
+}
+
+// Builds the stripped invite_room_state that lets an invitee's client render the room.
+async function buildInviteRoomState(
+  env: Env,
+  roomId: string,
+  inviterId: string
+): Promise<Array<{ type: string; state_key: string; content: unknown; sender: string }>> {
+  const wanted = new Set([
+    'm.room.create',
+    'm.room.join_rules',
+    'm.room.name',
+    'm.room.avatar',
+    'm.room.canonical_alias',
+    'm.room.encryption',
+  ]);
+
+  const stripped: Array<{ type: string; state_key: string; content: unknown; sender: string }> = [];
+  const state = await getRoomState(env.DB, roomId);
+  for (const ev of state) {
+    if (!wanted.has(ev.type)) continue;
+    stripped.push({
+      type: ev.type,
+      state_key: ev.state_key ?? '',
+      content: ev.content,
+      sender: ev.sender,
+    });
+  }
+
+  const inviterMember = await getStateEvent(env.DB, roomId, 'm.room.member', inviterId);
+  if (inviterMember) {
+    stripped.push({
+      type: inviterMember.type,
+      state_key: inviterMember.state_key ?? '',
+      content: inviterMember.content,
+      sender: inviterMember.sender,
+    });
+  }
+
+  return stripped;
+}
 
 // Validation for initial_state events
 interface StateEventValidation {
@@ -79,8 +216,7 @@ function validateStateEvent(event: any, index: number): StateEventValidation {
 
 // Creates the initial state events of a new room and returns the create event ID.
 async function createInitialRoomEvents(
-  db: D1Database,
-  serverName: string,
+  env: Env,
   roomId: string,
   roomVersion: string,
   creatorId: string,
@@ -94,41 +230,59 @@ async function createInitialRoomEvents(
     room_alias_local_part?: string;
   }
 ): Promise<string> {
+  const db = env.DB;
   const now = Date.now();
   let depth = 0;
-  const authEvents: string[] = [];
   const prevEvents: string[] = [];
 
-  // Helper to create and store an event
+  // auth_events must be the minimal set the auth rules allow, never all prior state.
+  let createId = '';
+  let creatorMemberId = '';
+  let powerLevelsId = '';
+  let joinRulesId = '';
+
+  // Signs and stores one event of the new room; every event here is sent by the creator.
   async function createEvent(
     type: string,
     content: any,
     stateKey?: string
   ): Promise<string> {
-    const eventId = await generateEventId(serverName, roomVersion);
-    const event: PDU = {
-      event_id: eventId,
+    const authEvents: string[] = [];
+    if (type !== 'm.room.create') {
+      if (createId) authEvents.push(createId);
+      if (powerLevelsId) authEvents.push(powerLevelsId);
+      if (creatorMemberId) authEvents.push(creatorMemberId);
+      if (type === 'm.room.member') {
+        const membership = content?.membership;
+        if ((membership === 'join' || membership === 'invite' || membership === 'knock') && joinRulesId) {
+          authEvents.push(joinRulesId);
+        }
+      }
+    }
+
+    const event: Record<string, any> = {
       room_id: roomId,
       sender: creatorId,
       type,
-      state_key: stateKey,
       content,
       origin_server_ts: now,
       depth: depth++,
-      auth_events: [...authEvents],
+      auth_events: authEvents,
       prev_events: [...prevEvents],
     };
-
-    // Calculate and attach content hash
-    const hash = await calculateContentHash(event as unknown as Record<string, unknown>);
-    event.hashes = { sha256: hash };
-
-    await storeEvent(db, event);
-
-    // Update auth/prev events for next event
     if (stateKey !== undefined) {
-      authEvents.push(eventId);
+      event.state_key = stateKey;
     }
+
+    const { eventId } = await finalizeAndStore(env, event, roomVersion);
+
+    // Track the IDs that later events may cite as auth events
+    if (type === 'm.room.create' && stateKey === '') createId = eventId;
+    else if (type === 'm.room.power_levels' && stateKey === '') powerLevelsId = eventId;
+    else if (type === 'm.room.join_rules' && stateKey === '') joinRulesId = eventId;
+    else if (type === 'm.room.member' && stateKey === creatorId) creatorMemberId = eventId;
+
+    // prev_events is the linear chain of the most recent event
     prevEvents.length = 0;
     prevEvents.push(eventId);
 
@@ -315,7 +469,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   // Create initial room events
   let createEventId: string | undefined;
   try {
-    createEventId = await createInitialRoomEvents(c.env.DB, c.env.SERVER_NAME, roomId, version, userId, {
+    createEventId = await createInitialRoomEvents(c.env, roomId, version, userId, {
       name,
       topic,
       preset,
@@ -368,6 +522,20 @@ function getServerFromRoomId(roomId: string): string | null {
   return match ? match[1] : null;
 }
 
+// Orders and de-duplicates federated join candidates: ?via= / ?server_name=
+// first, then the room ID's own domain as a fallback.
+function collectViaServers(via: string[], serverName: string[], roomServer: string): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const s of [...via, ...serverName, roomServer]) {
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      result.push(s);
+    }
+  }
+  return result;
+}
+
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -377,12 +545,21 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const roomServer = getServerFromRoomId(roomId);
   const isRemoteRoom = roomServer && roomServer !== c.env.SERVER_NAME;
 
-  // Check if room exists locally
+  // A rooms row alone can be an invite stub with no state; only a stored
+  // m.room.create means we hold the room locally.
   const room = await getRoom(c.env.DB, roomId);
+  const hasLocalState = room
+    ? !!(await getStateEvent(c.env.DB, roomId, 'm.room.create'))
+    : false;
 
-  // For remote rooms that don't exist locally, use the workflow for federation
-  if (!room && isRemoteRoom && roomServer) {
-    console.log('[rooms] Remote room join via workflow', { roomId, roomServer, userId });
+  if (isRemoteRoom && roomServer && !hasLocalState) {
+    const url = new URL(c.req.url);
+    const candidateServers = collectViaServers(
+      url.searchParams.getAll('via'),
+      url.searchParams.getAll('server_name'),
+      roomServer
+    );
+    console.log('[rooms] Remote room join via workflow', { roomId, roomServer, userId, candidateServers });
 
     // Trigger the RoomJoinWorkflow for durable federation handling
     const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
@@ -391,6 +568,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
         userId,
         isRemote: true,
         remoteServer: roomServer,
+        candidateServers,
       },
     });
 
@@ -495,17 +673,50 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
 
-  // Check current membership
   const currentMembership = await getMembership(c.env.DB, roomId, userId);
-  if (!currentMembership || currentMembership.membership !== 'join') {
+
+  // Leaving is idempotent: answering 403 strands a client whose local state still lists the
+  // room, since every action it offers then fails, including leaving again.
+  if (!currentMembership || currentMembership.membership === 'leave') {
+    return c.json({});
+  }
+
+  if (currentMembership.membership === 'ban') {
+    return Errors.forbidden('You are banned from this room').toResponse();
+  }
+
+  if (
+    currentMembership.membership !== 'join' &&
+    currentMembership.membership !== 'invite' &&
+    currentMembership.membership !== 'knock'
+  ) {
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
   // Create leave event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+
+  // An invite to a remote room arrives as stripped state, so there are no auth_events to
+  // build a leave PDU from: the resident server templates it for us. Membership is cleared
+  // either way, so a server that refuses cannot pin the room to the client forever.
+  if (!createEvent) {
+    const inviter = await c.env.DB.prepare(
+      `SELECT sender FROM events WHERE event_id = ?`
+    ).bind(currentMembership.eventId).first<{ sender: string }>();
+
+    const candidates = [...new Set(
+      [serverNameOf(inviter?.sender ?? ''), serverNameOf(roomId)]
+        .filter((server) => server && server !== c.env.SERVER_NAME)
+    )];
+
+    if (!(await leaveRemoteRoom(c.env, roomId, userId, candidates))) {
+      console.warn('[rooms] remote leave failed, clearing membership locally', { roomId, userId });
+    }
+
+    await updateMembership(c.env.DB, roomId, userId, 'leave', currentMembership.eventId);
+    return c.json({});
+  }
 
   const authEvents: string[] = [];
   if (createEvent) authEvents.push(createEvent.event_id);
@@ -519,8 +730,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
     membership: 'leave',
   };
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -532,11 +742,19 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  // Captured before we drop our own membership, so the leave still federates.
+  const leaveDestinations = await getRemoteServersInRoom(c.env.DB, roomId, c.env.SERVER_NAME);
+
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
   await updateMembership(c.env.DB, roomId, userId, 'leave', eventId);
 
   // Notify room members about the leave
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  if (leaveDestinations.length > 0) {
+    c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu, leaveDestinations));
+  }
 
   return c.json({});
 });
@@ -781,8 +999,6 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     return Errors.badJson().toResponse();
   }
 
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
 
@@ -794,8 +1010,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: eventType,
@@ -807,7 +1022,8 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
 
   // Invalidate room metadata cache if this is a metadata-affecting state event
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
@@ -828,6 +1044,8 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
       content.avatar_url
     );
   }
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   // Notify room members about the state change (wakes up long-polling syncs)
   await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
@@ -975,8 +1193,6 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     return Errors.badJson().toResponse();
   }
 
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
 
@@ -988,20 +1204,21 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
-  const event: PDU = {
-    event_id: eventId,
+  const originServerTs = Date.now();
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: eventType,
     content,
-    origin_server_ts: Date.now(),
+    origin_server_ts: originServerTs,
     unsigned: { transaction_id: txnId },
     depth: (latestEvents[0]?.depth ?? 0) + 1,
     auth_events: authEvents,
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
 
   // Store txnId for idempotency (best-effort)
   const responseBody = JSON.stringify({ event_id: eventId });
@@ -1011,6 +1228,8 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
        ON CONFLICT (user_id, txn_id) DO NOTHING`
     ).bind(userId, txnId, responseBody).run().catch(() => {})
   );
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   // Fire-and-forget: notify SyncDOs and push after returning the response
   c.executionCtx.waitUntil(
@@ -1023,7 +1242,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
             eventType,
             sender: userId,
             content,
-            originServerTs: event.origin_server_ts,
+            originServerTs,
           },
         }).catch(err => {
           console.error('[rooms] Push notification workflow error:', err);
@@ -1077,9 +1296,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return c.json({}); // Already invited, idempotent
   }
 
-  // Create invite event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
+  // Build the invite event; its ID is derived during finalization.
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1094,8 +1311,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     membership: 'invite',
   };
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1107,11 +1323,89 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const inviteeServer = serverPartOf(inviteeId);
+  const isRemoteInvitee = !!inviteeServer && inviteeServer !== c.env.SERVER_NAME;
+
+  if (isRemoteInvitee && inviteeServer) {
+    // The invitee's server co-signs the invite before we store it locally.
+    const finalized = await finalizeLocalEvent(c.env, event, roomVersion);
+    const inviteRoomState = await buildInviteRoomState(c.env, roomId, userId);
+
+    const path = `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${encodeURIComponent(finalized.eventId)}`;
+    let response: Response;
+    try {
+      response = await federationPut(
+        inviteeServer,
+        path,
+        {
+          event: finalized.wirePdu,
+          room_version: roomVersion,
+          invite_room_state: inviteRoomState,
+        },
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+    } catch (err) {
+      console.error('[rooms] remote invite transport error', { inviteeServer, roomId, error: err });
+      return Errors.unknown(
+        `Failed to reach ${inviteeServer}: ${err instanceof Error ? err.message : String(err)}`
+      ).toResponse();
+    }
+
+    if (!response.ok) {
+      let errBody: any = {};
+      try {
+        errBody = await response.json();
+      } catch {
+        // non-JSON error body
+      }
+      const errMsg =
+        typeof errBody?.error === 'string'
+          ? errBody.error
+          : `Remote server ${inviteeServer} rejected the invite (HTTP ${response.status})`;
+      console.warn('[rooms] remote invite rejected', { inviteeServer, roomId, status: response.status, errBody });
+      if (errBody?.errcode === 'M_FORBIDDEN') {
+        return Errors.forbidden(errMsg).toResponse();
+      }
+      return Errors.unknown(errMsg).toResponse();
+    }
+
+    // The returned event carries the remote server's signature; v2 responds with
+    // a bare object, v1 with a [code, body] tuple.
+    const parsed = (await response.json()) as
+      | { event?: Record<string, any> }
+      | [number, { event?: Record<string, any> }];
+    const responseData = Array.isArray(parsed) ? parsed[1] : parsed;
+    const remoteEvent = responseData?.event;
+
+    const mergedSignatures = mergeSignatures(
+      finalized.wirePdu.signatures as Record<string, Record<string, string>> | undefined,
+      remoteEvent?.signatures as Record<string, Record<string, string>> | undefined
+    );
+
+    const storedEvent = { ...finalized.storedEvent, signatures: mergedSignatures } as PDU;
+    await storeEvent(c.env.DB, storedEvent);
+    await updateMembership(c.env.DB, roomId, inviteeId, 'invite', finalized.eventId);
+
+    await notifyUsersOfEvent(c.env, roomId, finalized.eventId, 'm.room.member');
+
+    // The invitee's server already has the invite; this reaches the rest.
+    const mergedWire = { ...finalized.wirePdu, signatures: mergedSignatures };
+    c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, mergedWire));
+
+    return c.json({});
+  }
+
+  // Local invitee: no remote co-signing needed.
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
   await updateMembership(c.env.DB, roomId, inviteeId, 'invite', eventId);
 
   // Notify room members and the invitee about the invite
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   return c.json({});
 });
@@ -1157,8 +1451,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   }
 
   // Create leave event for target
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1175,8 +1467,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
     reason,
   };
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1188,11 +1479,14 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
   // Notify room members about the kick
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   return c.json({});
 });
@@ -1232,8 +1526,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
   }
 
   // Create ban event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const targetMembership = await getMembership(c.env.DB, roomId, targetId);
 
@@ -1251,8 +1543,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
     reason,
   };
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1264,11 +1555,14 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
   await updateMembership(c.env.DB, roomId, targetId, 'ban', eventId);
 
   // Notify room members about the ban
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   return c.json({});
 });
@@ -1411,8 +1705,6 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
   }
 
   // Create redaction event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1430,8 +1722,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
     redactionContent.reason = body.reason;
   }
 
-  const event: PDU = {
-    event_id: eventId,
+  const event: Record<string, any> = {
     room_id: roomId,
     sender: userId,
     type: 'm.room.redaction',
@@ -1444,12 +1735,15 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const roomVersion = await roomVersionOf(c.env, roomId);
+  const { eventId, wirePdu } = await finalizeAndStore(c.env, event, roomVersion);
 
   // Mark the original event as redacted
   await c.env.DB.prepare(`
     UPDATE events SET redacted_because = ? WHERE event_id = ?
   `).bind(eventId, targetEventId).run();
+
+  c.executionCtx.waitUntil(sendPduToServers(c.env, roomId, wirePdu));
 
   // Notify room members about the redaction
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.redaction');
@@ -1618,8 +1912,59 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     roomId = roomIdOrAlias;
   }
 
-  // Check if room exists
+  // A rooms row alone can be an invite stub with no state; only a stored
+  // m.room.create means we hold the room locally.
   const room = await getRoom(db, roomId);
+  const hasLocalState = room
+    ? !!(await getStateEvent(db, roomId, 'm.room.create'))
+    : false;
+
+  // A remote room ID we don't hold goes through the durable join workflow;
+  // remote aliases are out of scope here.
+  const roomServer = getServerFromRoomId(roomId);
+  const isRemoteRoom = roomServer && roomServer !== c.env.SERVER_NAME;
+  if (isRemoteRoom && roomServer && !hasLocalState) {
+    const url = new URL(c.req.url);
+    const candidateServers = collectViaServers(
+      url.searchParams.getAll('via'),
+      url.searchParams.getAll('server_name'),
+      roomServer
+    );
+    console.log('[rooms] Remote room join via workflow (/join)', {
+      roomId,
+      roomServer,
+      userId,
+      candidateServers,
+    });
+
+    const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
+      params: {
+        roomId,
+        userId,
+        isRemote: true,
+        remoteServer: roomServer,
+        candidateServers,
+      },
+    });
+
+    try {
+      const status = await instance.status();
+      if (status.status === 'running' || status.status === 'queued') {
+        // Join is in progress; the room will appear in sync when it completes.
+        return c.json({ room_id: roomId });
+      }
+      const output = status.output as JoinResult | undefined;
+      if (status.status === 'complete' && output?.success) {
+        return c.json({ room_id: roomId });
+      }
+      console.error('[rooms] Workflow failed (/join)', { roomId, status });
+      return Errors.unknown('Failed to join remote room').toResponse();
+    } catch (err) {
+      console.error('[rooms] Workflow error (/join)', { roomId, error: err });
+      return Errors.unknown('Failed to join remote room').toResponse();
+    }
+  }
+
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
   }
