@@ -197,6 +197,8 @@ interface ConnectionState {
   initialSyncComplete?: boolean;
   // Track rooms we've sent as "read" (notification_count = 0) to avoid resending
   roomSentAsRead?: Record<string, boolean>;
+  // High-water mark of the device-list stream already reported to this connection.
+  deviceListPos?: number;
 }
 
 // Helper to get the current maximum stream ordering from the database
@@ -1089,13 +1091,16 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
+      // Device list changes for the user and anyone sharing a room with them,
+      // tracked on the device_key_changes stream, not the event-stream `pos`.
+      const dlSince = connectionState.deviceListPos ?? 0;
+      const dlCurrent = await db.prepare(`
+        SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM device_key_changes
+      `).first<{ max_pos: number }>();
+      connectionState.deviceListPos = dlCurrent?.max_pos || 0;
       const deviceListChanged: string[] = [];
 
-      if (sincePos === 0) {
+      if (!body.pos) {
         // First sync reports the user's own ID so Element X sees that its
         // cross-signing keys were uploaded and can finish E2EE bootstrap.
         const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
@@ -1123,7 +1128,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
                   AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
               )
             )
-        `).bind(sincePos, userId, userId).all();
+        `).bind(dlSince, userId, userId).all();
         deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
       }
 
@@ -1747,13 +1752,16 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         unusedFallbackTypes.push(...(fallbackKeys.results as { algorithm: string }[]).map(row => row.algorithm));
       }
 
-      // Get device list changes
-      // Include the current user's own changes (important for cross-signing verification)
-      // AND other users who share rooms with the current user
-      const sincePos = body.pos ? parseInt(body.pos) : 0;
+      // Device list changes for the user and anyone sharing a room with them,
+      // tracked on the device_key_changes stream, not the event-stream `pos`.
+      const dlSince = connectionState.deviceListPos ?? 0;
+      const dlCurrent = await db.prepare(`
+        SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM device_key_changes
+      `).first<{ max_pos: number }>();
+      connectionState.deviceListPos = dlCurrent?.max_pos || 0;
       const deviceListChanged: string[] = [];
 
-      if (sincePos === 0) {
+      if (!body.pos) {
         // First sync reports the user's own ID so Element X sees that its
         // cross-signing keys were uploaded and can finish E2EE bootstrap.
         const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
@@ -1781,7 +1789,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
                   AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
               )
             )
-        `).bind(sincePos, userId, userId).all();
+        `).bind(dlSince, userId, userId).all();
         deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
       }
 

@@ -220,33 +220,50 @@ async function getDeviceListChanges(
   };
 }
 
+// Current high-water mark of the device-list change stream.
+async function getDeviceListStreamPosition(db: D1Database): Promise<number> {
+  const result = await db.prepare(`
+    SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM device_key_changes
+  `).first<{ max_pos: number }>();
+  return result?.max_pos || 0;
+}
+
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/sync - Sync with server
-// Parse composite sync token: "s{events}_td{to_device}" or legacy plain number
-function parseSyncToken(token: string | undefined): { events: number; toDevice: number } {
+// Parse composite sync token: "s{events}_td{to_device}_dl{device_lists}" or older variants
+// Each component tracks a SEPARATE stream - events, to-device messages, and
+// device list changes each have their own position counters that must never
+// be compared against each other.
+export function parseSyncToken(token: string | undefined): { events: number; toDevice: number; deviceLists: number } {
   if (!token) {
-    return { events: 0, toDevice: 0 };
+    return { events: 0, toDevice: 0, deviceLists: 0 };
   }
 
-  // Try composite format first: s84_td119
-  const match = token.match(/^s(\d+)_td(\d+)$/);
+  // Composite format: s84_td119_dl7 (the _dl component may be absent in tokens
+  // issued before it existed - treat as 0, which replays all device list
+  // changes once; over-reporting is safe, clients just re-download keys)
+  const match = token.match(/^s(\d+)_td(\d+)(?:_dl(\d+))?$/);
   if (match) {
-    return { events: parseInt(match[1]), toDevice: parseInt(match[2]) };
+    return {
+      events: parseInt(match[1]),
+      toDevice: parseInt(match[2]),
+      deviceLists: match[3] ? parseInt(match[3]) : 0,
+    };
   }
 
-  // Legacy format: plain number (use for both streams for backwards compat)
+  // Legacy format: plain number (use for both event streams for backwards compat)
   const num = parseInt(token);
   if (!isNaN(num)) {
-    return { events: num, toDevice: num };
+    return { events: num, toDevice: num, deviceLists: 0 };
   }
 
-  return { events: 0, toDevice: 0 };
+  return { events: 0, toDevice: 0, deviceLists: 0 };
 }
 
 // Build composite sync token
-function buildSyncToken(eventsPos: number, toDevicePos: number): string {
-  return `s${eventsPos}_td${toDevicePos}`;
+function buildSyncToken(eventsPos: number, toDevicePos: number, deviceListsPos: number): string {
+  return `s${eventsPos}_td${toDevicePos}_dl${deviceListsPos}`;
 }
 
 app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
@@ -264,11 +281,15 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     console.log('[sync] Using no filter (filter not found or invalid)');
   }
 
-  // Parse composite sync token (separate positions for events and to-device)
-  const { events: sincePosition, toDevice: sinceToDevice } = parseSyncToken(since);
+  // Parse composite sync token (separate positions for events, to-device, and device lists)
+  const { events: sincePosition, toDevice: sinceToDevice, deviceLists: sinceDeviceLists } = parseSyncToken(since);
 
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
+
+  // Get current device-list stream position (read before querying changes so a
+  // change landing mid-request is re-reported next sync rather than skipped)
+  const currentDeviceListsPos = await getDeviceListStreamPosition(c.env.DB);
 
   // Track to-device position for next_batch
   let currentToDevicePos = sinceToDevice;
@@ -320,9 +341,9 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
   }
 
-  // Get device list changes (users whose keys have changed since last sync)
+  // Device list changes, keyed off the device-list position from the token.
   if (sincePosition > 0) {
-    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sincePosition);
+    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sinceDeviceLists);
     if (deviceListChanges.changed.length > 0 || deviceListChanges.left.length > 0) {
       response.device_lists = deviceListChanges;
     }
@@ -583,7 +604,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Build composite next_batch token with separate positions for each stream
   if (!response.next_batch) {
-    response.next_batch = buildSyncToken(currentPosition, currentToDevicePos);
+    response.next_batch = buildSyncToken(currentPosition, currentToDevicePos, currentDeviceListsPos);
   }
 
   return c.json(response);

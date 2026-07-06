@@ -10,6 +10,7 @@ import { generateLoginToken, generateOpaqueId } from '../utils/ids';
 import { hashToken } from '../utils/crypto';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
+import { wakeSyncForUsers } from './to-device';
 
 const app = new Hono<AppEnv>();
 
@@ -1271,6 +1272,8 @@ app.post('/admin/api/server-notice', requireAuth(), requireAdmin, async (c) => {
       streamPosition
     ).run();
   }
+
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, [user_id]));
 
   return c.json({ success: true, devices_notified: devices.results.length });
 });

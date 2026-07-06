@@ -2,13 +2,79 @@
 // Spec: https://spec.matrix.org/v1.12/client-server-api/#device-management
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
+import { recordKeyChange } from './keys';
+import { wakeSyncForUsers } from './to-device';
 
 const app = new Hono<AppEnv>();
 
+// Remove every trace of a device: D1 rows plus the E2EE key stores. Device keys live in
+// the UserKeys Durable Object (primary) and the DEVICE_KEYS/ONE_TIME_KEYS KV namespaces
+// (cache), not in a D1 table.
+export async function purgeDevice(env: Env, db: D1Database, userId: string, deviceId: string): Promise<void> {
+  await db.prepare(`
+    DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
+  `).bind(userId, deviceId).run();
+  await db.prepare(`
+    DELETE FROM one_time_keys WHERE user_id = ? AND device_id = ?
+  `).bind(userId, deviceId).run();
+  await db.prepare(`
+    DELETE FROM fallback_keys WHERE user_id = ? AND device_id = ?
+  `).bind(userId, deviceId).run();
+  await db.prepare(`
+    DELETE FROM to_device_messages WHERE recipient_user_id = ? AND recipient_device_id = ?
+  `).bind(userId, deviceId).run();
+  await db.prepare(`
+    DELETE FROM devices WHERE user_id = ? AND device_id = ?
+  `).bind(userId, deviceId).run();
+
+  const stub = env.USER_KEYS.get(env.USER_KEYS.idFromName(userId));
+  await stub.fetch(new Request('http://internal/device-keys/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_id: deviceId }),
+  }));
+  await env.DEVICE_KEYS.delete(`device:${userId}:${deviceId}`);
+  await env.ONE_TIME_KEYS.delete(`otk:${userId}:${deviceId}`);
+
+  // Record on the device-list stream so other sessions see the device vanish
+  await recordKeyChange(db, userId, deviceId, 'delete');
+}
+
+// Validate the UIA auth dict for device deletion. Returns a Response to send
+// back on failure, or null when authentication succeeded.
+async function checkDeleteAuth(
+  db: D1Database,
+  userId: string,
+  auth: { type?: string; password?: string; session?: string },
+): Promise<Response | null> {
+  // Only the password stage is offered, so any other type is unrecognized and rejected
+  // rather than treated as authenticated.
+  if (auth.type !== 'm.login.password') {
+    return Response.json({
+      errcode: 'M_UNRECOGNIZED',
+      error: `Unrecognized authentication type: ${auth.type}`,
+    }, { status: 400 });
+  }
+
+  const user = await db.prepare(`
+    SELECT password_hash FROM users WHERE user_id = ?
+  `).bind(userId).first<{ password_hash: string | null }>();
+
+  if (!user?.password_hash || !auth.password) {
+    return Errors.forbidden('Invalid password').toResponse();
+  }
+
+  const valid = await verifyPassword(auth.password, user.password_hash);
+  if (!valid) {
+    return Errors.forbidden('Invalid password').toResponse();
+  }
+
+  return null;
+}
 
 // GET /_matrix/client/v3/devices - List all devices
 app.get('/_matrix/client/v3/devices', requireAuth(), async (c) => {
@@ -132,34 +198,16 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     }, 401);
   }
 
-  // Verify password if auth provided
-  if (auth.type === 'm.login.password') {
-    const user = await db.prepare(`
-      SELECT password_hash FROM users WHERE user_id = ?
-    `).bind(userId).first<{ password_hash: string }>();
-
-    if (!user || !auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-
-    const valid = await verifyPassword(auth.password, user.password_hash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
+  // Verify the auth dict (rejects unrecognized types and bad passwords)
+  const authError = await checkDeleteAuth(db, userId, auth);
+  if (authError) {
+    return authError;
   }
 
-  // Delete the device and its access tokens
-  await db.prepare(`
-    DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
+  await purgeDevice(c.env, db, userId, deviceId);
 
-  await db.prepare(`
-    DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
-
-  await db.prepare(`
-    DELETE FROM devices WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
+  // Wake the user's other sessions so the device list updates promptly
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, [userId]));
 
   return c.json({});
 });
@@ -190,36 +238,24 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
     }, 401);
   }
 
-  // Verify password if auth provided
-  if (body.auth.type === 'm.login.password') {
-    const user = await db.prepare(`
-      SELECT password_hash FROM users WHERE user_id = ?
-    `).bind(userId).first<{ password_hash: string }>();
-
-    if (!user || !body.auth.password) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
-
-    const valid = await verifyPassword(body.auth.password, user.password_hash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
+  // Verify the auth dict (rejects unrecognized types and bad passwords)
+  const authError = await checkDeleteAuth(db, userId, body.auth);
+  if (authError) {
+    return authError;
   }
 
-  // Delete each device
+  // Delete each device, but only ones that belong to this user
   for (const deviceId of body.devices) {
-    await db.prepare(`
-      DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
-
-    await db.prepare(`
-      DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
-
-    await db.prepare(`
-      DELETE FROM devices WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
+    const device = await db.prepare(`
+      SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?
+    `).bind(userId, deviceId).first();
+    if (device) {
+      await purgeDevice(c.env, db, userId, deviceId);
+    }
   }
+
+  // Wake the user's other sessions so the device list updates promptly
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, [userId]));
 
   return c.json({});
 });

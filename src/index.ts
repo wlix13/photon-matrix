@@ -366,11 +366,13 @@ app.get('/_matrix/client/v3/thirdparty/protocols', async (c) => {
   return c.json({});
 });
 
-// Dehydrated device (MSC3814 - stub)
+// Dehydrated device (MSC3814) is not implemented. The errcode is M_UNRECOGNIZED
+// because matrix-js-sdk reads M_NOT_FOUND as "supported, none stored yet" and
+// then aborts secret-storage setup on the follow-up PUT.
 app.get('/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device', async (c) => {
   return c.json({
-    errcode: 'M_NOT_FOUND',
-    error: 'No dehydrated device found',
+    errcode: 'M_UNRECOGNIZED',
+    error: 'Device dehydration is not supported by this server',
   }, 404);
 });
 

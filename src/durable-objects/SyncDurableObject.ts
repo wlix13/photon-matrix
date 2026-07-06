@@ -33,6 +33,7 @@ interface SlidingSyncConnectionState {
   roomFullyReadMarkers?: Record<string, string>;
   initialSyncComplete?: boolean;
   roomSentAsRead?: Record<string, boolean>;
+  deviceListPos?: number;
 }
 
 export class SyncDurableObject extends DurableObject<Env> {
@@ -57,6 +58,10 @@ export class SyncDurableObject extends DurableObject<Env> {
 
     if (path === '/notify') {
       return this.handleNotify(request);
+    }
+
+    if (path === '/wake') {
+      return this.handleWake();
     }
 
     if (path === '/pending') {
@@ -215,17 +220,31 @@ export class SyncDurableObject extends DurableObject<Env> {
       }
     }
 
-    const numResolvers = this.waitingResolvers.length;
-    const resolvers = this.waitingResolvers;
-    this.waitingResolvers = [];
-    for (const resolve of resolvers) {
-      resolve(true);
-    }
+    const numResolvers = this.wakeWaiters();
     if (numResolvers > 0) {
       console.log('[SyncDO] Woke up', numResolvers, 'waiting request(s)');
     }
 
     return new Response('OK');
+  }
+
+  // Wakes long-poll waiters without recording a pending event, for data held only
+  // in D1 (to-device messages) that the woken sync request re-reads for itself.
+  private handleWake(): Response {
+    const numResolvers = this.wakeWaiters();
+    if (numResolvers > 0) {
+      console.log('[SyncDO] /wake woke', numResolvers, 'waiting request(s)');
+    }
+    return new Response('OK');
+  }
+
+  private wakeWaiters(): number {
+    const resolvers = this.waitingResolvers;
+    this.waitingResolvers = [];
+    for (const resolve of resolvers) {
+      resolve(true);
+    }
+    return resolvers.length;
   }
 
   // Fallback long-poll wait: parks the request until a wake arrives or it times out.

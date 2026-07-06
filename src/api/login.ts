@@ -23,6 +23,7 @@ import {
   deleteAllUserTokens,
 } from '../services/database';
 import { requireAuth, extractAccessToken } from '../middleware/auth';
+import { purgeDevice } from './devices';
 
 const app = new Hono<AppEnv>();
 
@@ -162,18 +163,39 @@ app.post('/_matrix/client/v3/login', async (c) => {
 
 // POST /_matrix/client/v3/logout - Logout current session
 app.post('/_matrix/client/v3/logout', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const deviceId = c.get('deviceId');
+
   const token = extractAccessToken(c.req.raw);
   if (token) {
     const tokenHash = await hashToken(token);
     await deleteAccessToken(c.env.DB, tokenHash);
   }
+
+  // Dropping only the token would leave the device's E2EE keys in /keys/query, so senders
+  // keep encrypting to a session that can never read them.
+  if (deviceId) {
+    await purgeDevice(c.env, c.env.DB, userId, deviceId);
+  }
+
   return c.json({});
 });
 
 // POST /_matrix/client/v3/logout/all - Logout all sessions
 app.post('/_matrix/client/v3/logout/all', requireAuth(), async (c) => {
   const userId = c.get('userId');
+
+  const devices = await c.env.DB.prepare(
+    `SELECT device_id FROM devices WHERE user_id = ?`
+  ).bind(userId).all<{ device_id: string }>();
+
+  for (const device of devices.results) {
+    await purgeDevice(c.env, c.env.DB, userId, device.device_id);
+  }
+
+  // Catches tokens that were never bound to a device
   await deleteAllUserTokens(c.env.DB, userId);
+
   return c.json({});
 });
 
@@ -207,6 +229,19 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
   }
 
   const { userId, deviceId, accessTokenId } = tokenData;
+
+  // The refresh token outlives the session in KV, so without this a logged-out device
+  // could mint itself a new access token.
+  if (deviceId) {
+    const device = await c.env.DB.prepare(
+      `SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?`
+    ).bind(userId, deviceId).first();
+
+    if (!device) {
+      await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);
+      return Errors.unknownToken('Session has been logged out').toResponse();
+    }
+  }
 
   // Rotation: the presented refresh token and the access token it minted are both retired
   await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);

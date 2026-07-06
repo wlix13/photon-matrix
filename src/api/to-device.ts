@@ -4,7 +4,7 @@
 // Spec: https://spec.matrix.org/v1.12/client-server-api/#send-to-device-messaging
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 
@@ -38,6 +38,21 @@ async function getNextStreamPosition(db: D1Database, streamName: string): Promis
   `).bind(streamName).first<{ position: number }>();
 
   return upsertResult?.position ?? 1;
+}
+
+// Wake each recipient's SyncDurableObject so long-polling /sync and sliding sync
+// return the new messages immediately rather than after the ~25s poll timeout.
+export async function wakeSyncForUsers(env: Env, userIds: Iterable<string>): Promise<void> {
+  const wakes = [...new Set(userIds)].map(async (recipientUserId) => {
+    try {
+      const syncDO = env.SYNC.get(env.SYNC.idFromName(recipientUserId));
+      await syncDO.fetch(new Request('http://internal/wake', { method: 'POST' }));
+    } catch (error) {
+      // Delivery still happens on the next poll cycle - don't fail the send
+      console.error('[to-device] Failed to wake sync for', recipientUserId, error);
+    }
+  });
+  await Promise.all(wakes);
 }
 
 async function getUserDevices(db: D1Database, userId: string): Promise<string[]> {
@@ -118,6 +133,10 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
     ON CONFLICT (user_id, txn_id) DO NOTHING
   `).bind(userId, txnId).run();
 
+  // Wake recipients' long-polling sync after the response is sent - the
+  // messages are already committed to D1 at this point
+  c.executionCtx.waitUntil(wakeSyncForUsers(c.env, Object.keys(body.messages)));
+
   return c.json({});
 });
 
@@ -184,30 +203,20 @@ export async function getToDeviceMessages(
     }
   }
 
-  // Format events
   const events = messages.results.map(msg => ({
     sender: msg.sender_user_id,
     type: msg.event_type,
     content: JSON.parse(msg.content),
   }));
 
-  // Get the current max stream position for to-device messages
-  // This ensures we always return a valid next_batch, even on first sync
-  const currentPos = await db.prepare(`
-    SELECT COALESCE(MAX(stream_position), 0) as max_pos FROM to_device_messages
-  `).first<{ max_pos: number }>();
-  const maxStreamPos = currentPos?.max_pos || 0;
-
-  // Return the appropriate next_batch:
-  // - If we returned messages: use the max position of those messages
-  // - Otherwise: use the current max stream position (client is caught up)
+  // Advance only to the highest position actually returned, and leave the token alone on
+  // an empty response: a token past messages the client never got would acknowledge them.
   let nextBatch: string;
   if (messages.results.length > 0) {
     const maxReturnedPos = Math.max(...messages.results.map(m => m.stream_position));
     nextBatch = String(maxReturnedPos);
   } else {
-    // No messages to return - use current max position so client knows where we are
-    nextBatch = String(maxStreamPos);
+    nextBatch = String(sincePos);
   }
 
   return { events, nextBatch };

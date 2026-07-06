@@ -12,6 +12,7 @@ import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash } from '../services/database';
+import { parseSyncToken } from './sync';
 
 const app = new Hono<AppEnv>();
 
@@ -105,7 +106,7 @@ async function getNextStreamPosition(db: D1Database, streamName: string): Promis
   return result?.position || 1;
 }
 
-async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
+export async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
   const streamPosition = await getNextStreamPosition(db, 'device_keys');
 
   await db.prepare(`
@@ -352,6 +353,13 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
     }
   }
 
+  // Counts only: a device that comes back with no keys is what clients report as
+  // "doesn't support encryption", so this line is the first thing to check.
+  const querySummary = Object.entries(deviceKeys).map(([uid, devs]) =>
+    `${uid}=${Object.keys(devs).length}dev${masterKeys[uid] ? '+msk' : ''}${selfSigningKeys[uid] ? '+ssk' : ''}`
+  ).join(' ');
+  console.log('[keys/query] by', c.get('userId'), '->', querySummary || '(empty)');
+
   return c.json({
     device_keys: deviceKeys,
     master_keys: masterKeys,
@@ -484,8 +492,11 @@ app.get('/_matrix/client/v3/keys/changes', requireAuth(), async (c) => {
     return Errors.missingParam('from and to required').toResponse();
   }
 
-  const fromPosition = parseInt(from, 10) || 0;
-  const toPosition = parseInt(to, 10) || Number.MAX_SAFE_INTEGER;
+  // from/to are sync tokens ("s{events}_td{toDevice}_dl{deviceLists}") - the
+  // device-list component is the one that matches device_key_changes positions
+  const fromPosition = parseSyncToken(from).deviceLists;
+  const parsedTo = parseSyncToken(to).deviceLists;
+  const toPosition = parsedTo > 0 ? parsedTo : Number.MAX_SAFE_INTEGER;
 
   // Only users sharing a joined room with the requester are reported
   const changes = await db.prepare(`
@@ -503,20 +514,13 @@ app.get('/_matrix/client/v3/keys/changes', requireAuth(), async (c) => {
     change_type: string;
   }>();
 
-  const changed: string[] = [];
-  const left: string[] = [];
-
-  for (const change of changes.results) {
-    if (change.change_type === 'delete') {
-      left.push(change.user_id);
-    } else {
-      changed.push(change.user_id);
-    }
-  }
+  // Per spec a deleted device still counts as "changed"; "left" is for users the client
+  // no longer shares an encrypted room with, which is not tracked yet.
+  const changed = [...new Set(changes.results.map(change => change.user_id))];
 
   return c.json({
-    changed: [...new Set(changed)],
-    left: [...new Set(left)],
+    changed,
+    left: [],
   });
 });
 
