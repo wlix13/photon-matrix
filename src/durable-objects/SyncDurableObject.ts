@@ -64,6 +64,10 @@ export class SyncDurableObject extends DurableObject<Env> {
       return this.handleWake();
     }
 
+    if (path === '/wait-ws') {
+      return this.handleWaitWs(request);
+    }
+
     if (path === '/pending') {
       return this.handlePending(request);
     }
@@ -205,14 +209,17 @@ export class SyncDurableObject extends DurableObject<Env> {
     // Add to in-memory list
     this.pendingEvents.push(data);
 
-    // Notify all connected WebSockets
+    // Client sockets receive the event payload; waiter sockets get a bare wake below.
     const message = JSON.stringify({
       type: 'event',
       event: data,
     });
 
-    const webSockets = this.ctx.getWebSockets();
-    for (const ws of webSockets) {
+    const waiters = new Set(this.ctx.getWebSockets('waiter'));
+    for (const ws of this.ctx.getWebSockets()) {
+      if (waiters.has(ws)) {
+        continue;
+      }
       try {
         ws.send(message);
       } catch (e) {
@@ -221,8 +228,9 @@ export class SyncDurableObject extends DurableObject<Env> {
     }
 
     const numResolvers = this.wakeWaiters();
-    if (numResolvers > 0) {
-      console.log('[SyncDO] Woke up', numResolvers, 'waiting request(s)');
+    const numSockets = await this.wakeWaiterSockets();
+    if (numResolvers + numSockets > 0) {
+      console.log('[SyncDO] Woke up', numResolvers, 'legacy +', numSockets, 'ws waiter(s)');
     }
 
     return new Response('OK');
@@ -230,10 +238,11 @@ export class SyncDurableObject extends DurableObject<Env> {
 
   // Wakes long-poll waiters without recording a pending event, for data held only
   // in D1 (to-device messages) that the woken sync request re-reads for itself.
-  private handleWake(): Response {
+  private async handleWake(): Promise<Response> {
     const numResolvers = this.wakeWaiters();
-    if (numResolvers > 0) {
-      console.log('[SyncDO] /wake woke', numResolvers, 'waiting request(s)');
+    const numSockets = await this.wakeWaiterSockets();
+    if (numResolvers + numSockets > 0) {
+      console.log('[SyncDO] /wake woke', numResolvers, 'legacy +', numSockets, 'ws waiter(s)');
     }
     return new Response('OK');
   }
@@ -245,6 +254,56 @@ export class SyncDurableObject extends DurableObject<Env> {
       resolve(true);
     }
     return resolvers.length;
+  }
+
+  // Wake hibernatable-WebSocket waiters (see handleWaitWs) and record the wake
+  // timestamp so a waiter connecting a moment later can detect it missed one.
+  private async wakeWaiterSockets(): Promise<number> {
+    await this.ctx.storage.put('last_wake_ts', Date.now());
+
+    const waiters = this.ctx.getWebSockets('waiter');
+    for (const ws of waiters) {
+      try {
+        ws.send('wake');
+        ws.close(1000, 'wake');
+      } catch {
+        // Socket already closing - the worker side treats close as timeout
+      }
+    }
+    return waiters.length;
+  }
+
+  // Long-poll wait: accepts the socket and returns immediately, leaving nothing
+  // in flight that would block hibernation. The worker owns the timeout.
+  private async handleWaitWs(request: Request): Promise<Response> {
+    const upgradeHeader = request.headers.get('Upgrade');
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+      return new Response('Expected websocket upgrade', { status: 426 });
+    }
+
+    const url = new URL(request.url);
+    // The instant the worker started reading D1. A wake recorded at or after it
+    // landed while that read was in flight, so it is replayed straight away
+    // rather than leaving the client parked until the poll timeout.
+    const sinceTs = parseInt(url.searchParams.get('since_ts') || '0');
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, ['waiter']);
+
+    if (sinceTs > 0) {
+      const lastWakeTs = await this.ctx.storage.get<number>('last_wake_ts') || 0;
+      if (lastWakeTs >= sinceTs) {
+        try {
+          server.send('wake');
+          server.close(1000, 'wake');
+        } catch {
+          // Worker side will fall back to its timeout
+        }
+      }
+    }
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   // Fallback long-poll wait: parks the request until a wake arrives or it times out.
@@ -352,7 +411,11 @@ export class SyncDurableObject extends DurableObject<Env> {
     if (session) {
       this.sessions.delete(ws);
     }
-    ws.close(code, reason);
+    try {
+      ws.close(code, reason);
+    } catch {
+      // Already closed (waiter sockets are one-shot) or a reserved code we cannot echo.
+    }
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {

@@ -1342,6 +1342,8 @@ function detectNSERequest(
 // MSC4186 Simplified Sliding Sync handler (shared between endpoints)
 async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   const userId = c.get('userId');
+  // Captured before any D1 reads - see waitForWake's since_ts race guard
+  const requestStartTs = Date.now();
   const db = c.env.DB;
   const syncDO = c.env.SYNC;  // Use Durable Object for connection state (not KV - avoids rate limits)
 
@@ -2021,43 +2023,23 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Debug logging for response
   console.log('[sliding-sync] Response:', { userId, responsePos: response.pos, hasChanges, timeout, willWait: !hasChanges && timeout > 0 });
 
-  // ALWAYS save connection state - flags like initialSyncComplete must be persisted
-  // We use Durable Objects now (not KV), so rate limits aren't a concern
-  // Previously we only saved when hasChanges, but this caused initialSyncComplete
-  // to not persist, resulting in ephemeral data spam on every request
+  // Save unconditionally: flags like initialSyncComplete must persist even when
+  // there was nothing to report.
   try {
     await saveConnectionState(syncDO, userId, connId, connectionState);
   } catch (error) {
     console.error('[sliding-sync] Failed to save connection state:', error);
-    // Don't return error here - state can be rebuilt on next request
-    // But client may experience duplicated ephemeral data
+    // State can be rebuilt on the next request, at the cost of duplicate ephemeral data.
   }
 
-  // Long-polling: if no changes and timeout > 0, wait for events via Durable Object
-  // The SyncDurableObject will wake us up when events arrive for this user
-  // Per MSC3575/MSC4186, server should wait up to timeout ms for new events
+  // Nothing to report: park the request on the Sync DO for up to timeout ms
+  // before responding (MSC3575/MSC4186).
   if (!hasChanges && timeout > 0) {
-    console.log('[sliding-sync] No changes, waiting for events via DO, timeout:', timeout, 'ms');
-    try {
-      const doId = syncDO.idFromName(userId);
-      const stub = syncDO.get(doId);
-      const waitResponse = await stub.fetch(new Request('http://internal/wait-for-events', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timeout }),
-      }));
-      const waitResult = await waitResponse.json() as { hasEvents: boolean };
-
-      if (waitResult.hasEvents) {
-        console.log('[sliding-sync] Woken up early - events arrived');
-        // Events arrived while waiting - return immediately so client makes new request
-        // The next request will pick up the new events
-      } else {
-        console.log('[sliding-sync] Wait timed out, no new events');
-      }
-    } catch (error) {
-      console.error('[sliding-sync] Error waiting for events:', error);
-      // Fall through and return current response on error
+    const { waitForWake } = await import('../services/sync-wait');
+    const woke = await waitForWake(c.env, userId, Math.min(timeout, 25000), requestStartTs);
+    if (woke) {
+      console.log('[sliding-sync] Woken up early - events arrived');
+      // Responds immediately; the client's next request picks up the events.
     }
   }
 
