@@ -3,11 +3,12 @@
 // and Matrix-specific extensions (MSC2965, MSC3861)
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { hashToken, verifyPassword, timingSafeEqual } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
 import { createDevice, createAccessToken, getUserById } from '../services/database';
+import { getIdTokenSigningKey, signJwt, ID_TOKEN_TTL } from '../services/oidc-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -34,7 +35,10 @@ interface AuthorizationCode {
   scope: string;
   code_challenge?: string;
   code_challenge_method?: string;
+  // Echoed into the id_token; absent when the client did not send one
   nonce?: string;
+  // Seconds; feeds the id_token auth_time claim. Optional for codes minted before it existed.
+  auth_time?: number;
   created_at: number;
   expires_at: number;
 }
@@ -102,6 +106,33 @@ async function hashClientSecret(secret: string): Promise<string> {
   const data = encoder.encode(secret);
   const hash = await crypto.subtle.digest('SHA-256', data);
   return base64UrlEncode(new Uint8Array(hash));
+}
+
+// Mint an OIDC id_token for an authorization_code exchange. The issuer must be byte-identical
+// to the one advertised by /_matrix/client/v1/auth_metadata and /.well-known/openid-configuration,
+// or clients reject the token.
+async function issueIdToken(
+  env: Env,
+  authCode: AuthorizationCode,
+  clientId: string
+): Promise<string> {
+  const issuer = `https://${env.WORKER_DOMAIN || env.SERVER_NAME}`;
+  const now = Math.floor(Date.now() / 1000);
+
+  const claims: Record<string, unknown> = {
+    iss: issuer,
+    sub: authCode.user_id,
+    aud: clientId,
+    iat: now,
+    exp: now + ID_TOKEN_TTL,
+    auth_time: authCode.auth_time ?? Math.floor(authCode.created_at / 1000),
+  };
+
+  if (authCode.nonce) {
+    claims.nonce = authCode.nonce;
+  }
+
+  return signJwt(claims, await getIdTokenSigningKey(env.CACHE));
 }
 
 // ============================================
@@ -296,6 +327,7 @@ app.post('/oauth/authorize', async (c) => {
     code_challenge: authRequest.code_challenge,
     code_challenge_method: authRequest.code_challenge_method,
     nonce: authRequest.nonce,
+    auth_time: Math.floor(Date.now() / 1000),
     created_at: Date.now(),
     expires_at: Date.now() + 10 * 60 * 1000, // 10 minutes
   };
@@ -461,7 +493,7 @@ app.post('/oauth/token', async (c) => {
       expirationTtl: 30 * 24 * 60 * 60, // 30 days
     });
 
-    return c.json({
+    const response: Record<string, unknown> = {
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: 86400, // 24 hours
@@ -470,7 +502,14 @@ app.post('/oauth/token', async (c) => {
       // Matrix-specific fields
       user_id: authCode.user_id,
       device_id: deviceId,
-    });
+    };
+
+    // OIDC clients (Element Web/Desktop via oidc-client-ts) reject a response without one
+    if (scopes.includes('openid')) {
+      response.id_token = await issueIdToken(c.env, authCode, effectiveClientId);
+    }
+
+    return c.json(response);
 
   } else if (grantType === 'refresh_token') {
     if (!refreshToken) {
@@ -518,6 +557,8 @@ app.post('/oauth/token', async (c) => {
       expirationTtl: 30 * 24 * 60 * 60,
     });
 
+    // No id_token here: OIDC requires it to repeat the nonce of the original authorization,
+    // which the refresh token does not carry. Clients keep the profile from the first exchange.
     return c.json({
       access_token: newAccessToken,
       token_type: 'Bearer',

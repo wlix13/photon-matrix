@@ -2,6 +2,7 @@
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
+import { getIdTokenJwks } from '../services/oidc-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -72,8 +73,8 @@ app.get('/.well-known/openid-configuration', (c) => {
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256', 'plain'],
     subject_types_supported: ['public'],
-    id_token_signing_alg_values_supported: ['RS256', 'ES256'],
-    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'name', 'email'],
+    id_token_signing_alg_values_supported: ['RS256'],
+    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'auth_time', 'nonce', 'name', 'email'],
     // Matrix-specific extension
     'org.matrix.matrix-authentication-service': {
       graphql_endpoint: null,
@@ -84,12 +85,10 @@ app.get('/.well-known/openid-configuration', (c) => {
   });
 });
 
-// GET /.well-known/jwks.json - JSON Web Key Set for token verification
-app.get('/.well-known/jwks.json', (c) => {
-  // Empty key set: access tokens are opaque, so there is nothing for clients to verify
-  return c.json({
-    keys: [],
-  });
+// GET /.well-known/jwks.json - JSON Web Key Set clients use to verify id_tokens.
+// Access tokens stay opaque; only the id_token is signed.
+app.get('/.well-known/jwks.json', async (c) => {
+  return c.json(await getIdTokenJwks(c.env.CACHE));
 });
 
 // GET /.well-known/matrix/support - Server support contact information
