@@ -304,7 +304,47 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     ).bind(event.event_id, redacts, event.room_id).run();
   }
 
+  await storeEventRelations(db, event);
+
   return streamOrdering;
+}
+
+// Index content['m.relates_to'] so /relations and /threads can find child events.
+async function storeEventRelations(db: D1Database, event: PDU): Promise<void> {
+  try {
+    const relatesTo = event.content?.['m.relates_to'];
+    if (!relatesTo || typeof relatesTo !== 'object' || Array.isArray(relatesTo)) return;
+
+    const rel = relatesTo as {
+      rel_type?: unknown;
+      event_id?: unknown;
+      key?: unknown;
+      is_falling_back?: unknown;
+      'm.in_reply_to'?: unknown;
+    };
+
+    // [relates_to_id, relation_type, aggregation_key]
+    const rows: [string, string, string | null][] = [];
+
+    if (typeof rel.rel_type === 'string' && rel.rel_type && typeof rel.event_id === 'string' && rel.event_id) {
+      rows.push([rel.event_id, rel.rel_type, typeof rel.key === 'string' ? rel.key : null]);
+    }
+
+    // A thread's reply fallback points at the root but is not itself a reply.
+    const replyTo = (rel['m.in_reply_to'] as { event_id?: unknown } | null | undefined)?.event_id;
+    if (typeof replyTo === 'string' && replyTo && rel.is_falling_back !== true) {
+      rows.push([replyTo, 'm.in_reply_to', null]);
+    }
+
+    for (const [relatesToId, relationType, aggregationKey] of rows) {
+      await db.prepare(
+        `INSERT OR IGNORE INTO event_relations (event_id, relates_to_id, relation_type, aggregation_key)
+         VALUES (?, ?, ?, ?)`
+      ).bind(event.event_id, relatesToId, relationType, aggregationKey).run();
+    }
+  } catch (error) {
+    console.error('[database] Failed to index event relation:', error);
+  }
 }
 
 export async function getEvent(db: D1Database, eventId: string): Promise<PDU | null> {

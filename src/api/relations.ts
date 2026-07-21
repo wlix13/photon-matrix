@@ -50,11 +50,13 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
   const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
   const dir = c.req.query('dir') || 'b'; // backwards by default
 
-  // Query relations
+  // Query relations. DISTINCT because one event may relate to the same target twice
+  // (a threaded reply also carries an m.in_reply_to).
   let query = `
-    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
+    SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ?
+    JOIN event_relations r ON r.event_id = e.event_id
+    WHERE e.room_id = ? AND r.relates_to_id = ?
   `;
   const params: any[] = [roomId, eventId];
 
@@ -124,7 +126,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ?
+    JOIN event_relations r ON r.event_id = e.event_id
+    WHERE e.room_id = ? AND r.relates_to_id = ? AND r.relation_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
   `).bind(roomId, eventId, relType, limit + 1).all<{
@@ -181,7 +184,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
-    WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ? AND e.event_type = ?
+    JOIN event_relations r ON r.event_id = e.event_id
+    WHERE e.room_id = ? AND r.relates_to_id = ? AND r.relation_type = ? AND e.event_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
   `).bind(roomId, eventId, relType, eventType, limit + 1).all<{
@@ -236,15 +240,18 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
     FROM events e
     WHERE e.room_id = ? AND e.event_id IN (
-      SELECT DISTINCT relates_to_event_id FROM events
-      WHERE room_id = ? AND relation_type = 'm.thread'
+      SELECT DISTINCT r.relates_to_id FROM event_relations r
+      JOIN events c ON c.event_id = r.event_id
+      WHERE c.room_id = ? AND r.relation_type = 'm.thread'
     )
   `;
   const params: any[] = [roomId, roomId];
 
   if (include === 'participated') {
     query += ` AND (e.sender = ? OR EXISTS (
-      SELECT 1 FROM events r WHERE r.relates_to_event_id = e.event_id AND r.sender = ?
+      SELECT 1 FROM event_relations r
+      JOIN events c ON c.event_id = r.event_id
+      WHERE r.relates_to_id = e.event_id AND c.sender = ?
     ))`;
     params.push(userId, userId);
   }
