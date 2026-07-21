@@ -300,6 +300,16 @@ app.post('/_matrix/client/v3/publicRooms', async (c) => {
 });
 
 // User directory search (requires authentication per Matrix spec)
+type DirectoryUser = { user_id: string; display_name: string | null; avatar_url: string | null };
+
+// users_fts comes from a manually applied migration; D1 only reports its absence in the error text
+function isMissingUsersFts(err: unknown): boolean {
+  const message = err instanceof Error
+    ? `${err.message} ${err.cause instanceof Error ? err.cause.message : ''}`
+    : String(err);
+  return message.includes('no such table') && message.includes('users_fts');
+}
+
 app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) => {
   const db = c.env.DB;
   const requestingUserId = c.get('userId');
@@ -325,27 +335,69 @@ app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) =>
     return c.json({ results: [], limited: false });
   }
 
-  // Search for users using FTS5 for ranked full-text search
-  const ftsSearchTerm = searchTerm.replace(/['"*()]/g, ' ').trim();
-  const results = await db.prepare(`
-    SELECT u.user_id, u.display_name, u.avatar_url
-    FROM users_fts fts
-    JOIN users u ON fts.user_id = u.user_id
-    WHERE users_fts MATCH ?
-      AND u.is_deactivated = 0
-      AND u.is_guest = 0
-      AND u.user_id != ?
-    ORDER BY bm25(users_fts)
-    LIMIT ?
-  `).bind(ftsSearchTerm, requestingUserId, limit + 1).all<{
-    user_id: string;
-    display_name: string | null;
-    avatar_url: string | null;
-  }>();
+  // FTS tokenisation drops the punctuation of "@alice:example.org", so resolve exact IDs directly
+  let exactUserId: string | null = null;
+  if (/^@[^:\s]+:\S+$/.test(searchTerm)) {
+    exactUserId = searchTerm;
+  } else if (/^@?[^@:\s]+$/.test(searchTerm)) {
+    exactUserId = `@${searchTerm.replace(/^@/, '')}:${c.env.SERVER_NAME}`;
+  }
 
-  const limited = results.results.length > limit;
+  const exactMatch = exactUserId
+    ? await db.prepare(`
+        SELECT user_id, display_name, avatar_url
+        FROM users
+        WHERE user_id = ?
+          AND is_deactivated = 0
+          AND is_guest = 0
+          AND user_id != ?
+      `).bind(exactUserId, requestingUserId).first<DirectoryUser>()
+    : null;
+
+  // Quote each token: anything outside letters/digits is an FTS5 operator
+  const ftsSearchTerm = (searchTerm.match(/[\p{L}\p{N}_]+/gu) ?? []).map(t => `"${t}"`).join(' ');
+  let ranked: DirectoryUser[] = [];
+
+  if (ftsSearchTerm) {
+    // Search for users using FTS5 for ranked full-text search
+    try {
+      const results = await db.prepare(`
+        SELECT u.user_id, u.display_name, u.avatar_url
+        FROM users_fts fts
+        JOIN users u ON fts.user_id = u.user_id
+        WHERE users_fts MATCH ?
+          AND u.is_deactivated = 0
+          AND u.is_guest = 0
+          AND u.user_id != ?
+        ORDER BY bm25(users_fts)
+        LIMIT ?
+      `).bind(ftsSearchTerm, requestingUserId, limit + 1).all<DirectoryUser>();
+      ranked = results.results;
+    } catch (err) {
+      if (!isMissingUsersFts(err)) throw err;
+      console.log('[user_directory] users_fts missing, using LIKE fallback:', { searchTerm });
+      const likeTerm = `%${searchTerm}%`;
+      const results = await db.prepare(`
+        SELECT user_id, display_name, avatar_url
+        FROM users
+        WHERE (user_id LIKE ? OR display_name LIKE ?)
+          AND is_deactivated = 0
+          AND is_guest = 0
+          AND user_id != ?
+        ORDER BY user_id
+        LIMIT ?
+      `).bind(likeTerm, likeTerm, requestingUserId, limit + 1).all<DirectoryUser>();
+      ranked = results.results;
+    }
+  }
+
+  const matches = exactMatch
+    ? [exactMatch, ...ranked.filter(u => u.user_id !== exactMatch.user_id)]
+    : ranked;
+
+  const limited = matches.length > limit;
   // Return explicit null values (not undefined/omitted) so Element X knows user exists
-  const users = results.results.slice(0, limit).map(u => ({
+  const users = matches.slice(0, limit).map(u => ({
     user_id: u.user_id,
     display_name: u.display_name || null,
     avatar_url: u.avatar_url || null,
