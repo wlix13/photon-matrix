@@ -31,8 +31,14 @@ export function buildMultipartMediaResponse(
 ): Response {
   const boundary = `matrixmedia${crypto.randomUUID().replace(/-/g, '')}`;
 
-  const disposition = filename
-    ? `Content-Disposition: inline; filename="${filename.replace(/"/g, '')}"\r\n`
+  // A control character in the filename would inject extra MIME headers or end the part early.
+  const safeFilename = filename
+    ?.replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+    .replace(/[\\/]/g, '_')
+    .replace(/"/g, "'")
+    .trim();
+  const disposition = safeFilename
+    ? `Content-Disposition: inline; filename="${safeFilename}"\r\n`
     : '';
   const preamble = encoder.encode(
     `--${boundary}\r\n` +

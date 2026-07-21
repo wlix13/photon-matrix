@@ -45,9 +45,11 @@ async function serveRemoteMedia(
 
   const cached = await env.MEDIA.get(cacheKey);
   if (cached) {
+    const cachedType = cached.httpMetadata?.contentType || 'application/octet-stream';
     return new Response(cached.body, {
       headers: {
-        'Content-Type': cached.httpMetadata?.contentType || 'application/octet-stream',
+        'Content-Type': cachedType,
+        'Content-Disposition': contentDisposition(dispositionFor(cachedType)),
         'Cache-Control': 'public, max-age=31536000, immutable',
       },
     });
@@ -68,16 +70,19 @@ async function serveRemoteMedia(
 
   const headers = new Headers();
   headers.set('Content-Type', media.contentType);
-  if (media.filename) {
-    headers.set('Content-Disposition', `inline; filename="${media.filename.replace(/"/g, '')}"`);
-  }
+  headers.set(
+    'Content-Disposition',
+    contentDisposition(dispositionFor(media.contentType), media.filename),
+  );
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   return new Response(media.data, { headers });
 }
 
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
-// Supported MIME types (not currently enforced on upload).
+// MIME types this server recognises. Matrix does not let servers restrict what may be uploaded,
+// so this is not an upload filter: it decides what we are willing to render in the browser.
+// A type outside this list is unknown enough that we only ever hand it over as a download.
 export const SUPPORTED_TYPES = [
   'image/jpeg',
   'image/png',
@@ -96,6 +101,48 @@ export const SUPPORTED_TYPES = [
   'application/octet-stream',
 ];
 
+// Recognised, but able to carry script that would run with the media origin's privileges.
+const INLINE_UNSAFE_TYPES = new Set([
+  'image/svg+xml',
+  'text/html',
+  'text/xml',
+  'application/xml',
+  'application/xhtml+xml',
+]);
+
+// Uploaded bytes are only rendered in place when their type is both recognised and inert;
+// everything else is forced to download so stored markup can't become XSS on the media domain.
+function dispositionFor(contentType: string | null | undefined): 'inline' | 'attachment' {
+  const type = (contentType || '').split(';')[0].trim().toLowerCase();
+  return SUPPORTED_TYPES.includes(type) && !INLINE_UNSAFE_TYPES.has(type) ? 'inline' : 'attachment';
+}
+
+// Build a Content-Disposition value that survives a hostile filename: controls (CR/LF header
+// injection) and path separators go, the quoted ASCII form is the lowest-common-denominator
+// fallback, and the real name rides along in RFC 5987 form for clients that understand it.
+function contentDisposition(
+  disposition: 'inline' | 'attachment',
+  filename?: string | null,
+): string {
+  if (!filename) return disposition;
+
+  const clean = filename
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+    .replace(/[\\/]/g, '_')
+    .trim();
+  if (!clean) return disposition;
+
+  // Quoted-string only tolerates printable ASCII, and `"` would close it early.
+  const ascii = clean.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, "'");
+  // encodeURIComponent leaves four characters that RFC 5987's attr-char set excludes.
+  const encoded = encodeURIComponent(clean).replace(
+    /['()*]/g,
+    (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
 // POST /_matrix/media/v3/upload - Upload media
 app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -112,6 +159,11 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const mxcUri = `mxc://${c.env.SERVER_NAME}/${mediaId}`;
 
   const body = await c.req.arrayBuffer();
+
+  // Content-Length is a client claim; the body we actually read is what counts.
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
 
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: {
@@ -153,11 +205,13 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
     `SELECT content_type, filename FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
 
+  const contentType = metadata?.content_type || 'application/octet-stream';
   const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  if (metadata?.filename) {
-    headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
-  }
+  headers.set('Content-Type', contentType);
+  headers.set(
+    'Content-Disposition',
+    contentDisposition(dispositionFor(contentType), metadata?.filename),
+  );
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
   return new Response(object.body, { headers });
@@ -183,9 +237,13 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
     `SELECT content_type FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string }>();
 
+  const contentType = metadata?.content_type || 'application/octet-stream';
   const headers = new Headers();
-  headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-  headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
+  headers.set('Content-Type', contentType);
+  headers.set(
+    'Content-Disposition',
+    contentDisposition(dispositionFor(contentType), requestedFilename),
+  );
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
   return new Response(object.body, { headers });
@@ -232,6 +290,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   if (!isImage) {
     const headers = new Headers();
     headers.set('Content-Type', metadata.content_type);
+    headers.set('Content-Disposition', contentDisposition(dispositionFor(metadata.content_type)));
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');
     return new Response(object.body, { headers });
   }
@@ -269,6 +328,8 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
 
   const headers = new Headers();
   headers.set('Content-Type', metadata.content_type);
+  // Resizing fell through, so these are the original uploaded bytes, not a generated JPEG.
+  headers.set('Content-Disposition', contentDisposition(dispositionFor(metadata.content_type)));
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   headers.set('X-Thumbnail-Generated', 'false');
 
@@ -466,6 +527,11 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
 
   const body = await c.req.arrayBuffer();
 
+  // Content-Length is a client claim; the body we actually read is what counts.
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
+
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: { contentType },
     customMetadata: {
@@ -536,6 +602,11 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
 
   const body = await c.req.arrayBuffer();
 
+  // Content-Length is a client claim; the body we actually read is what counts.
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
+
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: { contentType },
     customMetadata: {
@@ -572,11 +643,13 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
       `SELECT content_type, filename FROM media WHERE media_id = ?`
     ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
 
+    const contentType = metadata?.content_type || 'application/octet-stream';
     const headers = new Headers();
-    headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-    if (metadata?.filename) {
-      headers.set('Content-Disposition', `inline; filename="${metadata.filename}"`);
-    }
+    headers.set('Content-Type', contentType);
+    headers.set(
+      'Content-Disposition',
+      contentDisposition(dispositionFor(contentType), metadata?.filename),
+    );
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
     return new Response(object.body, { headers });
@@ -604,9 +677,13 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
       `SELECT content_type FROM media WHERE media_id = ?`
     ).bind(mediaId).first<{ content_type: string }>();
 
+    const contentType = metadata?.content_type || 'application/octet-stream';
     const headers = new Headers();
-    headers.set('Content-Type', metadata?.content_type || 'application/octet-stream');
-    headers.set('Content-Disposition', `inline; filename="${requestedFilename}"`);
+    headers.set('Content-Type', contentType);
+    headers.set(
+      'Content-Disposition',
+      contentDisposition(dispositionFor(contentType), requestedFilename),
+    );
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');
 
     return new Response(object.body, { headers });
@@ -686,6 +763,8 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
 
     const headers = new Headers();
     headers.set('Content-Type', metadata.content_type);
+    // Not a generated JPEG: either a non-image or a resize that fell through, so raw upload bytes.
+    headers.set('Content-Disposition', contentDisposition(dispositionFor(metadata.content_type)));
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');
     if (isImage) {
       headers.set('X-Thumbnail-Generated', 'false');
