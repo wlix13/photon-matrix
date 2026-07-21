@@ -1,12 +1,7 @@
-// To-Device Messages API
-// Implements: https://spec.matrix.org/v1.12/client-server-api/#send-to-device-messaging
-//
-// To-device messages are used for:
-// - E2E encryption key exchange (m.room_key, m.room_key_request)
-// - Device verification (m.key.verification.*)
-// - Direct device-to-device communication
-//
-// Messages are delivered via /sync and sliding sync extensions
+// To-device messaging: E2EE key exchange (m.room_key), device verification
+// (m.key.verification.*) and other direct device-to-device events, delivered to the
+// recipient through /sync and the sliding sync to_device extension.
+// Spec: https://spec.matrix.org/v1.12/client-server-api/#send-to-device-messaging
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
@@ -15,19 +10,11 @@ import { requireAuth } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
 
-// ============================================
-// Types
-// ============================================
-
 interface ToDeviceRequest {
   messages: Record<string, Record<string, any>>;
   // messages[user_id][device_id] = content
   // device_id can be "*" to send to all devices
 }
-
-// ============================================
-// Helper Functions
-// ============================================
 
 async function getNextStreamPosition(db: D1Database, streamName: string): Promise<number> {
   // Atomic UPDATE with RETURNING - no race condition
@@ -61,10 +48,6 @@ async function getUserDevices(db: D1Database, userId: string): Promise<string[]>
   return devices.results.map(d => d.device_id);
 }
 
-// ============================================
-// Endpoints
-// ============================================
-
 // PUT /sendToDevice/:eventType/:txnId - Send to-device messages
 app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -78,7 +61,6 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   `).bind(userId, txnId).first<{ response: string }>();
 
   if (existingTxn) {
-    // Return cached response for idempotency
     return c.json(JSON.parse(existingTxn.response || '{}'));
   }
 
@@ -93,7 +75,6 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
     return Errors.missingParam('messages').toResponse();
   }
 
-  // Process each recipient user
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
     // Get list of device IDs to send to
     let targetDevices: string[];
@@ -140,10 +121,7 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   return c.json({});
 });
 
-// ============================================
-// Internal helper: Get to-device messages for sync
-// ============================================
-
+// Pending to-device messages for one device, plus the to-device token to hand back.
 export async function getToDeviceMessages(
   db: D1Database,
   userId: string,
@@ -151,24 +129,21 @@ export async function getToDeviceMessages(
   since?: string,
   limit: number = 100
 ): Promise<{ events: any[]; nextBatch: string }> {
-  // Parse the since token - it's a stream position
-  // IMPORTANT: Validate that since is a reasonable stream position (not a timestamp)
+  // The since token is a to-device stream position: those stay well below 1e9, while a
+  // client that sends epoch milliseconds instead is above 1e12.
   let sincePos = 0;
   if (since) {
     const parsed = parseInt(since);
-    // Stream positions should be reasonable numbers (< 1 billion)
-    // Timestamps would be > 1 trillion (milliseconds since epoch)
     if (!isNaN(parsed) && parsed > 0 && parsed < 1000000000) {
       sincePos = parsed;
     } else if (parsed >= 1000000000) {
-      // This looks like a timestamp, ignore it and treat as first sync
+      // Timestamp-shaped token: ignore it and treat this as a first sync
       console.log('[to-device] Ignoring invalid since token (looks like timestamp):', since);
     }
   }
 
-  // STEP 1: Get undelivered messages FIRST (before any acknowledgment)
-  // This ensures we have a snapshot of what exists before any modifications
-  // and prevents race conditions where messages are marked delivered before being fetched
+  // Read the pending messages before acknowledging anything, so a message can never be
+  // marked delivered without having been returned to the client.
   const messages = await db.prepare(`
     SELECT id, sender_user_id, event_type, content, stream_position
     FROM to_device_messages
@@ -186,9 +161,7 @@ export async function getToDeviceMessages(
     stream_position: number;
   }>();
 
-  // STEP 2: NOW acknowledge previously sent messages
-  // Only acknowledge up to the sincePos the client sent back
-  // This means the client has confirmed receipt of everything <= sincePos
+  // By echoing sincePos the client confirms receipt of everything up to it.
   if (sincePos > 0) {
     const ackResult = await db.prepare(`
       UPDATE to_device_messages
@@ -204,7 +177,6 @@ export async function getToDeviceMessages(
     }
   }
 
-  // Debug: Log to-device retrieval
   if (messages.results.length > 0) {
     console.log('[to-device] Returning', messages.results.length, 'messages to', userId, 'device:', deviceId);
     for (const msg of messages.results) {
@@ -241,10 +213,7 @@ export async function getToDeviceMessages(
   return { events, nextBatch };
 }
 
-// ============================================
-// Cleanup old messages (can be called periodically)
-// ============================================
-
+// Drop delivered messages older than maxAgeMs; called periodically.
 export async function cleanupOldToDeviceMessages(db: D1Database, maxAgeMs: number = 7 * 24 * 60 * 60 * 1000): Promise<number> {
   const cutoff = Date.now() - maxAgeMs;
 

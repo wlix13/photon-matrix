@@ -1,4 +1,4 @@
-// Cloudflare Workers Environment Types
+// Cloudflare bindings and the Hono context types built on them
 
 export interface Env {
   // D1 Database
@@ -33,7 +33,7 @@ export interface Env {
   ADMIN_CONTACT_MXID?: string;
   SUPPORT_PAGE_URL?: string;
 
-  // Secrets (to be configured)
+  // Secrets
   SIGNING_KEY?: string;
 
   // OIDC encryption key for client secrets (32 random bytes, base64 encoded)

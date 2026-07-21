@@ -572,10 +572,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     if (waitResult.hasEvents) {
       console.log('[sync] Woken up early - events arrived for', userId);
-      // New events arrived - return empty response with SAME next_batch
-      // Client will immediately sync again and get the new events
-      // We intentionally do NOT advance next_batch here, so the client
-      // re-syncs from the same position and actually sees the events
+      // Responds with next_batch unchanged, so the client re-syncs from the same
+      // position and picks up the new events.
     }
   } else if (timeout > 0 && sincePosition > 0) {
     console.log('[sync] Skipping DO wait for', userId, '- hasChanges:', hasChanges,

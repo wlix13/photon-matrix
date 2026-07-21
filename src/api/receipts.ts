@@ -1,11 +1,5 @@
-// Read Receipts API
-// Implements: https://spec.matrix.org/v1.12/client-server-api/#receipts
-//
-// Read receipts track which events users have read.
-// Types:
-// - m.read: Public read receipt (visible to others) - stored in Room DO
-// - m.read.private: Private read receipt (only visible to self) - stored in Room DO
-// - m.fully_read: Read marker (stored in account data for unread counts)
+// Read receipts - https://spec.matrix.org/v1.12/client-server-api/#receipts
+// m.read (public) and m.read.private live in the Room DO; m.fully_read is room account data.
 
 import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
@@ -37,7 +31,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
 
   console.log('[receipts] POST request from', userId, 'type:', receiptType, 'event:', eventId, 'room:', roomId);
 
-  // Validate receipt type
   const validTypes = ['m.read', 'm.read.private', 'm.fully_read'];
   if (!validTypes.includes(receiptType)) {
     return c.json({
@@ -46,7 +39,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     }, 400);
   }
 
-  // Check membership
   const membership = await db.prepare(`
     SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
   `).bind(roomId, userId).first<{ membership: string }>();
@@ -55,7 +47,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Parse optional body for thread_id
   let threadId: string | undefined;
   try {
     const body = await c.req.json();
@@ -64,8 +55,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     // Body is optional
   }
 
-  // m.fully_read is special - it's room account data, not an ephemeral receipt
-  // Store it in account_data table so it's returned in account_data extension
+  // m.fully_read is room account data, not an ephemeral receipt.
   if (receiptType === 'm.fully_read') {
     await db.prepare(`
       INSERT INTO account_data (user_id, room_id, event_type, content)
@@ -75,7 +65,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     `).bind(userId, roomId, JSON.stringify({ event_id: eventId })).run();
     console.log('[receipts] Stored m.fully_read in account_data for', userId, 'in room', roomId, 'event', eventId);
   } else {
-    // Store m.read and m.read.private in Room Durable Object
     const roomDO = getRoomDO(c.env, roomId);
     await roomDO.fetch(new Request('https://room/receipt', {
       method: 'PUT',
@@ -89,8 +78,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
     }));
     console.log('[receipts] Stored', receiptType, 'in Room DO for', userId, 'in room', roomId, 'event', eventId);
 
-    // Also update m.fully_read when m.read is set - Element X uses m.fully_read for unread counts
-    // This keeps the read marker in sync with the read receipt
+    // Element X derives unread counts from m.fully_read, so keep the marker in sync with m.read.
     if (receiptType === 'm.read') {
       await db.prepare(`
         INSERT INTO account_data (user_id, room_id, event_type, content)
@@ -122,7 +110,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
     return Errors.badJson().toResponse();
   }
 
-  // Check membership
   const membership = await db.prepare(`
     SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?
   `).bind(roomId, userId).first<{ membership: string }>();
@@ -131,7 +118,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Process m.fully_read (stored in account data for unread counts)
   if (body['m.fully_read']) {
     await db.prepare(`
       INSERT INTO account_data (user_id, room_id, event_type, content)
@@ -144,7 +130,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 
   const roomDO = getRoomDO(c.env, roomId);
 
-  // Process m.read (stored in Room DO)
   if (body['m.read']) {
     await roomDO.fetch(new Request('https://room/receipt', {
       method: 'PUT',
@@ -156,8 +141,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
       }),
     }));
 
-    // If m.fully_read wasn't explicitly provided, also update it to match m.read
-    // This keeps unread counts in sync for clients that only send m.read
+    // Clients that send only m.read still need the marker moved, or unread counts never clear.
     if (!body['m.fully_read']) {
       await db.prepare(`
         INSERT INTO account_data (user_id, room_id, event_type, content)
@@ -169,7 +153,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
     }
   }
 
-  // Process m.read.private (stored in Room DO)
   if (body['m.read.private']) {
     await roomDO.fetch(new Request('https://room/receipt', {
       method: 'PUT',
@@ -189,8 +172,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
 // Internal Helpers
 // ============================================
 
-// Get receipts for a room (for sync) - fetches from Room Durable Object
-// requestingUserId is used to filter m.read.private receipts - they should only be visible to the owner
+// Fetch a room's receipts from the Room DO; m.read.private is filtered down to requestingUserId.
 export async function getReceiptsForRoom(
   env: Env,
   roomId: string,
@@ -208,7 +190,6 @@ export async function getReceiptsForRoom(
     receipts: Record<string, Record<string, Record<string, { ts: number; thread_id?: string }>>>;
   };
 
-  // Filter private receipts - m.read.private should only be visible to the owner
   if (requestingUserId) {
     const filteredReceipts: typeof data.receipts = {};
 
@@ -217,19 +198,16 @@ export async function getReceiptsForRoom(
 
       for (const [receiptType, users] of Object.entries(receiptTypes)) {
         if (receiptType === 'm.read.private') {
-          // Only include private receipt if it belongs to the requesting user
           if (users[requestingUserId]) {
             filteredReceipts[eventId][receiptType] = {
               [requestingUserId]: users[requestingUserId],
             };
           }
         } else {
-          // Include all public receipts
           filteredReceipts[eventId][receiptType] = users;
         }
       }
 
-      // Remove empty event entries
       if (Object.keys(filteredReceipts[eventId]).length === 0) {
         delete filteredReceipts[eventId];
       }
@@ -247,8 +225,7 @@ export async function getReceiptsForRoom(
   };
 }
 
-// Get receipts for multiple rooms (for sync)
-// requestingUserId is used to filter m.read.private receipts
+// Fetch receipts for several rooms in parallel, keyed by room ID.
 export async function getReceiptsForRooms(
   env: Env,
   roomIds: string[],

@@ -1,5 +1,4 @@
-// Matrix Homeserver on Cloudflare Workers
-// Main entry point
+// Matrix homeserver entry point: middleware, route mounting and error handling
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -46,17 +45,16 @@ import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth } from './middleware/auth';
 import { analyticsMiddleware } from './middleware/analytics';
 
-// Import Durable Objects
+// Durable Object classes, re-exported for the Workers runtime
 export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
 
-// Import Workflows
+// Workflow classes, re-exported for the Workers runtime
 export { RoomJoinWorkflow, PushNotificationWorkflow, FederationCatchupWorkflow, MediaCleanupWorkflow, StateCompactionWorkflow } from './workflows';
 
-// Create the main app
 const app = new Hono<AppEnv>();
 
-// CORS for Matrix clients - MUST BE FIRST to ensure headers are always sent
-// (even on error responses from rate limiter or other middleware)
+// CORS runs first so headers are present even on error responses from later
+// middleware such as the rate limiter.
 app.use('*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -79,9 +77,7 @@ app.get('/health', (c) => c.json({ status: 'ok', server: 'matrix-worker' }));
 app.get('/admin', (c) => {
   const html = adminDashboardHtml(c.env.SERVER_NAME);
   return c.html(html, 200, {
-    // Content-Security-Policy for XSS protection
-    // 'unsafe-inline' is needed for the inline scripts/styles in the dashboard
-    // This could be improved by moving scripts to external files with nonces
+    // 'unsafe-inline' is required by the dashboard's inline scripts and styles
     'Content-Security-Policy':
       "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'",
     'X-Content-Type-Options': 'nosniff',
@@ -193,8 +189,6 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
   });
 });
 
-// Push rules now handled by push.ts
-
 // Filter endpoints - persist filters in KV for sync optimization
 app.post('/_matrix/client/v3/user/:userId/filter', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -247,18 +241,7 @@ app.get('/_matrix/client/v3/user/:userId/filter/:filterId', requireAuth(), async
   }
 });
 
-// Account data endpoints now handled by account-data.ts
-
-// Presence endpoints now handled by presence.ts
-
-// Search endpoint - now handled by search.ts
 app.route('/', search);
-
-// Typing notifications now handled by typing.ts
-
-// Read receipts now handled by receipts.ts
-
-// Device management now handled by devices.ts
 
 // Public rooms directory
 app.get('/_matrix/client/v3/publicRooms', async (c) => {
@@ -309,7 +292,7 @@ app.get('/_matrix/client/v3/publicRooms', async (c) => {
 });
 
 app.post('/_matrix/client/v3/publicRooms', async (c) => {
-  // Same as GET but with search/filter support
+  // POST variant with filtering: not implemented, returns an empty chunk
   return c.json({
     chunk: [],
     total_room_count_estimate: 0,
@@ -391,15 +374,12 @@ app.get('/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device', asyn
   }, 404);
 });
 
-// OIDC auth metadata endpoints are now handled by oidc-auth.ts
-// Legacy unstable endpoint for backwards compatibility
+// Legacy unstable auth-metadata endpoints (MSC2965), redirected to the stable route
 app.get('/_matrix/client/unstable/org.matrix.msc2965/auth_issuer', async (c) => {
-  // Redirect to the stable endpoint implementation
   return c.redirect('/_matrix/client/v1/auth_metadata', 307);
 });
 
 app.get('/_matrix/client/unstable/org.matrix.msc2965/auth_metadata', async (c) => {
-  // Redirect to the stable endpoint implementation
   return c.redirect('/_matrix/client/v1/auth_metadata', 307);
 });
 

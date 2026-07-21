@@ -1,7 +1,5 @@
-// Device Management API
-// Implements: https://spec.matrix.org/v1.12/client-server-api/#device-management
-//
-// Manages user devices for E2EE and session management.
+// Device management: listing, renaming and deleting a user's devices/sessions.
+// Spec: https://spec.matrix.org/v1.12/client-server-api/#device-management
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
@@ -11,9 +9,6 @@ import { verifyPassword } from '../utils/crypto';
 
 const app = new Hono<AppEnv>();
 
-// ============================================
-// Endpoints
-// ============================================
 
 // GET /_matrix/client/v3/devices - List all devices
 app.get('/_matrix/client/v3/devices', requireAuth(), async (c) => {
@@ -92,7 +87,6 @@ app.put('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     return Errors.notFound('Device not found').toResponse();
   }
 
-  // Update display name if provided
   if (body.display_name !== undefined) {
     await db.prepare(`
       UPDATE devices SET display_name = ? WHERE user_id = ? AND device_id = ?
@@ -106,7 +100,7 @@ app.put('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
 app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const deviceId = c.req.param('deviceId');
-  // Note: currentDeviceId could be used to prevent self-deletion in future
+  // The requesting device is not treated specially - a session may delete itself
   void c.get('deviceId');
   const db = c.env.DB;
 

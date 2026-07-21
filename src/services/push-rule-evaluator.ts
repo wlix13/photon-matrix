@@ -1,6 +1,4 @@
-// Push Rule Evaluator Service
-// Provides notification and highlight counting using push rule evaluation
-// Extracted for use by sync and sliding-sync endpoints
+// Notification and highlight counting driven by push rules, shared by /sync and sliding sync.
 
 import { evaluatePushRules } from '../api/push';
 

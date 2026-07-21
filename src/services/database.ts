@@ -743,8 +743,7 @@ export async function getServersInRoomsWithUser(db: D1Database, userId: string):
     .filter((s): s is string => s !== null);
 }
 
-// Notify all room members' SyncDurableObjects when a new event is stored
-// This wakes up any long-polling sync requests waiting for events
+// Notify each joined member's SyncDurableObject so long-polling syncs wake up
 export async function notifyUsersOfEvent(
   env: Env,
   roomId: string,
@@ -760,7 +759,6 @@ export async function notifyUsersOfEvent(
     console.log('[database] Notifying', members.results.length, 'users of event', eventId,
       'users:', members.results.map(m => m.user_id).join(', '));
 
-    // Notify each user's SyncDurableObject in parallel
     const notifications = members.results.map(async (member) => {
       try {
         const syncDO = env.SYNC.get(env.SYNC.idFromName(member.user_id));

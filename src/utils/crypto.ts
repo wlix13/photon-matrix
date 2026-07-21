@@ -70,7 +70,7 @@ export async function verifyPassword(password: string, storedHash: string): Prom
   return hashB64 === expectedHash;
 }
 
-// SHA-256 hash
+// SHA-256 digest as unpadded URL-safe base64
 export async function sha256(data: string | Uint8Array): Promise<string> {
   const encoder = new TextEncoder();
   const bytes = typeof data === 'string' ? encoder.encode(data) : data;
@@ -86,8 +86,7 @@ export async function hashToken(token: string): Promise<string> {
   return sha256(token);
 }
 
-// Ed25519 algorithm parameters for Cloudflare Workers
-// Note: NODE-ED25519 is Cloudflare Workers' proprietary Ed25519 implementation
+// NODE-ED25519 is Cloudflare Workers' proprietary Ed25519 implementation
 interface Ed25519Params {
   name: 'NODE-ED25519';
   namedCurve: 'NODE-ED25519';
@@ -104,7 +103,6 @@ export async function generateSigningKeyPair(): Promise<{
   privateKeyJwk: JsonWebKey;
   keyId: string;
 }> {
-  // Generate Ed25519 key pair using Cloudflare Workers' native support
   const keyPair = (await crypto.subtle.generateKey(
     { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params,
     true, // extractable
@@ -134,8 +132,7 @@ export async function generateSigningKeyPair(): Promise<{
   };
 }
 
-// Legacy function for backwards compatibility during migration
-// Returns the old format but with a proper key
+// Legacy wrapper returning the private key as a JSON string instead of a JWK
 export async function generateSigningKeyPairLegacy(): Promise<{
   publicKey: string;
   privateKey: string;
@@ -165,7 +162,6 @@ export async function signJson(
   delete toSign['signatures'];
   delete toSign['unsigned'];
 
-  // Import the private key
   const privateKey = await crypto.subtle.importKey(
     'jwk',
     jwk,
@@ -210,7 +206,6 @@ export async function verifySignature(
   publicKeyB64: string
 ): Promise<boolean> {
   try {
-    // Get the signature
     const signatures = obj.signatures as Record<string, Record<string, string>> | undefined;
     const signature = signatures?.[serverName]?.[keyId];
     if (!signature) {
@@ -222,10 +217,8 @@ export async function verifySignature(
     delete toVerify['signatures'];
     delete toVerify['unsigned'];
 
-    // Decode the public key
     const publicKeyBytes = base64UrlDecode(publicKeyB64);
 
-    // Import the public key
     const publicKey = await crypto.subtle.importKey(
       'raw',
       publicKeyBytes,
@@ -234,13 +227,10 @@ export async function verifySignature(
       ['verify']
     );
 
-    // Decode the signature
     const signatureBytes = base64UrlDecode(signature);
 
-    // Get canonical JSON
     const canonical = canonicalJson(toVerify);
 
-    // Verify the signature
     return await crypto.subtle.verify(
       { name: 'NODE-ED25519' },
       publicKey,
@@ -308,8 +298,7 @@ export async function verifyContentHash(
 export function generateRandomString(length: number = 32): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const charsLen = chars.length; // 62 characters
-  // Use rejection sampling to avoid modulo bias
-  // 256 % 62 = 8, so we reject values >= 248 to ensure uniform distribution
+  // Rejection sampling to avoid modulo bias: 256 % 62 = 8, so reject bytes >= 248
   const maxValid = 256 - (256 % charsLen); // 248
   const result: string[] = [];
   

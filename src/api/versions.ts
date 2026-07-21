@@ -41,15 +41,13 @@ app.get('/.well-known/matrix/server', (c) => {
   });
 });
 
-// GET /.well-known/openid-configuration - OIDC Discovery endpoint
-// This is required for Element Web OIDC-native authentication
-// See: https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api
+// GET /.well-known/openid-configuration - OIDC discovery, required by Element Web's
+// OIDC-native login. Spec: https://spec.matrix.org/v1.17/client-server-api/#oauth-20-api
 app.get('/.well-known/openid-configuration', (c) => {
   const serverName = c.env.SERVER_NAME;
   const baseUrl = `https://${serverName}`;
 
-  // Return standard OIDC discovery document
-  // Element Web requires all these fields to be present
+  // Element Web requires every field of this discovery document to be present
   return c.json({
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
@@ -86,9 +84,7 @@ app.get('/.well-known/openid-configuration', (c) => {
 
 // GET /.well-known/jwks.json - JSON Web Key Set for token verification
 app.get('/.well-known/jwks.json', (c) => {
-  // Return an empty JWKS - clients can't verify our tokens without keys
-  // In a real implementation, you'd generate and store RSA keys
-  // For now, returning a placeholder that indicates we use opaque tokens
+  // Empty key set: access tokens are opaque, so there is nothing for clients to verify
   return c.json({
     keys: [],
   });
@@ -103,7 +99,6 @@ app.get('/.well-known/matrix/support', (c) => {
     matrix_id?: string;
   }> = [];
 
-  // Add admin contact if configured
   if (c.env.ADMIN_CONTACT_EMAIL || c.env.ADMIN_CONTACT_MXID) {
     contacts.push({
       role: 'm.role.admin',

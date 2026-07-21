@@ -1,5 +1,4 @@
-// Sliding Sync API (MSC3575 & MSC4186)
-// Implements both the original sliding sync and simplified sliding sync
+// Sliding Sync API: MSC3575 (original) and MSC4186 (simplified).
 
 import { Hono, type Context } from 'hono';
 import type { AppEnv } from '../types';
@@ -177,7 +176,7 @@ interface ExtensionsResponse {
   };
 }
 
-// Connection state stored in Durable Object (previously KV, migrated to avoid rate limits)
+// Per-connection sync state, stored in the user's Sync Durable Object.
 interface ConnectionState {
   userId: string;
   pos: number;  // Actual stream_ordering from database
@@ -208,7 +207,7 @@ async function getCurrentStreamPosition(db: D1Database): Promise<number> {
   return result?.max_pos ?? 0;
 }
 
-// Helper to get or create connection state using Durable Object (not KV - avoids rate limits)
+// Loads connection state from the user's Sync Durable Object, or null if there is none.
 async function getConnectionState(
   syncDO: DurableObjectNamespace,
   userId: string,
@@ -272,16 +271,13 @@ async function saveConnectionState(
   }
 }
 
-// Get rooms for a user with optional filtering
-// OPTIMIZED: Uses consolidated query with subqueries to avoid N+1 problem
+// Rooms a user is in, filtered and sorted, in one query with subqueries.
 async function getUserRooms(
   db: D1Database,
   userId: string,
   filters?: SlidingRoomFilter,
   sort?: string[]
 ): Promise<{ roomId: string; membership: string; lastActivity: number; name?: string; isDm: boolean }[]> {
-  // Consolidated query with subqueries for room name and member count
-  // This eliminates N+1 queries by fetching all data in a single query
   let query = `
     SELECT
       rm.room_id,
@@ -364,8 +360,7 @@ async function getUserRooms(
   return rooms;
 }
 
-// Get room data for response
-// OPTIMIZED: Uses DB.batch() to fetch all room metadata in a single network call
+// Room data for a sync response: metadata, required state, timeline and counts.
 async function getRoomData(
   db: D1Database,
   roomId: string,
@@ -381,8 +376,7 @@ async function getRoomData(
     membership: 'join',  // MSC4186: explicitly indicate this is a joined room
   };
 
-  // OPTIMIZATION: Batch all metadata queries into a single network call
-  // This reduces 8+ sequential queries to 1 batched call
+  // One batched call instead of eight sequential metadata queries.
   const [
     roomResult,
     nameResult,
@@ -741,7 +735,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
   }
 
   const connId = body.conn_id || 'default';
-  // Note: timeout is parsed but not used yet (for future long-polling support)
+  // Timeout is parsed but unused: this endpoint does not long-poll.
   const _ = Math.min(body.timeout || 0, 30000); void _;
 
   // Get current stream position from database
@@ -760,15 +754,15 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }, 503);
   }
 
-  // IMPORTANT: pos can be in query string OR body - check both
+  // pos may arrive in the query string or in the body.
   const queryPos = c.req.query('pos');
   const posToken = queryPos || body.pos;
   const sincePos = posToken ? parseInt(posToken) : 0;
-  // Note: isInitialSync is computed but not currently used (for future diagnostics)
+  // Computed for diagnostics only; the result is discarded.
   void (!posToken || !connectionState);
 
-  // If client sends a pos but we don't have connection state, check if the pos
-  // is a valid stream position (could be from before a deployment or KV expiry)
+  // A pos with no stored connection state (deployment or expiry): if it is not
+  // ahead of the current stream position, treat it as a reconnect.
   if (posToken && !connectionState) {
     if (sincePos <= currentStreamPos) {
       // Valid position, create fresh connection state treating it as a reconnect
@@ -910,7 +904,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         const firstTimeRead = currentNotificationCount === 0
           && !connectionState.roomSentAsRead?.[roomInfo.roomId];
 
-        // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
         if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
           response.rooms[roomInfo.roomId] = roomData;
 
@@ -1006,7 +999,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       const firstTimeRead = currentNotificationCount === 0
         && !connectionState.roomSentAsRead?.[roomId];
 
-      // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
       if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
         response.rooms[roomId] = roomData;
 
@@ -1041,13 +1033,13 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
   }
 
-  // Process extensions
+  // Process extensions. An extension counts as enabled when its key is present
+  // (MSC4186) or set to enabled=true (MSC3575).
   if (body.extensions) {
     const extensionKeys = Object.keys(body.extensions);
     console.log('[sliding-sync] Extensions requested:', extensionKeys, 'by user:', userId);
 
     // To-device messages
-    // to_device: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.to_device) {
       const limit = body.extensions.to_device.limit || 100;
       const deviceId = c.get('deviceId');
@@ -1069,7 +1061,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
 
     // E2EE extension
-    // e2ee: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.e2ee) {
       const deviceId = c.get('deviceId');
 
@@ -1105,9 +1096,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       const deviceListChanged: string[] = [];
 
       if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
+        // First sync reports the user's own ID so Element X sees that its
+        // cross-signing keys were uploaded and can finish E2EE bootstrap.
         const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
         const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
         const deviceIds = await deviceIdsResp.json() as string[];
@@ -1148,7 +1138,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
 
     // Account data extension
-    // account_data: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.account_data) {
       // Get global account data from D1
       const globalData = await db.prepare(`
@@ -1168,8 +1157,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         }
       }
 
-      // CRITICAL: Get E2EE account data from Durable Object (strongly consistent)
-      // This ensures SSSS data is immediately visible after being written
+      // E2EE account data comes from the strongly consistent DO, so SSSS data is
+      // visible immediately after it is written.
       const { getE2EEAccountDataFromDO } = await import('./account-data');
       try {
         const e2eeData = await getE2EEAccountDataFromDO(c.env, userId);
@@ -1211,7 +1200,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
 
     // Typing extension - uses Room Durable Objects
-    // typing: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.typing) {
       const responseRoomIds = Object.keys(response.rooms);
       const subscribedRoomIds = body.room_subscriptions ? Object.keys(body.room_subscriptions) : [];
@@ -1233,7 +1221,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
 
     // Receipts extension - uses Room Durable Objects
-    // receipts: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.receipts) {
       // Collect room IDs from response AND room subscriptions
       // (room_subscriptions may include rooms not in response.rooms)
@@ -1256,7 +1243,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
 
     // Presence extension
-    // presence: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.presence) {
       response.extensions.presence = { events: [] };
 
@@ -1286,7 +1272,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
     }
   }
 
-  // ALWAYS save connection state - using DO now (not KV), no rate limit concerns
+  // Save unconditionally so tracking state survives even when nothing changed.
   try {
     await saveConnectionState(syncDO, userId, connId, connectionState);
   } catch (error) {
@@ -1296,12 +1282,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
   return c.json(response);
 });
 
-// Helper to detect if a request looks like it's from the iOS NSE (Notification Service Extension)
-// NSE requests are typically:
-// - Single room subscription (the room with the push notification)
-// - Minimal or no extensions
-// - User-agent may differ from main app
-// - Made shortly after push notification delivery
+// Heuristic for spotting requests from the iOS Notification Service Extension,
+// which subscribes to one room, asks for few extensions and uses its own user-agent.
 function detectNSERequest(
   userAgent: string | undefined,
   body: SlidingSyncRequest
@@ -1407,8 +1389,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }, 503);
   }
 
-  // IMPORTANT: pos can be in query string OR body - check both
-  // Element X sends pos in query string, other clients may use body
+  // pos may arrive in the query string (Element X) or in the body.
   const queryPos = c.req.query('pos');
   const posToken = queryPos || body.pos;
   const sincePos = posToken ? parseInt(posToken) : 0;
@@ -1430,9 +1411,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     userAgent: userAgent?.substring(0, 100), // Truncate for log readability
   });
 
-  // If client sends a pos but we don't have connection state, check if the pos
-  // is a valid stream position (could be from before a deployment or KV expiry)
-  // If it's <= current position, treat as reconnect and rebuild state
+  // A pos with no stored connection state (deployment or expiry): if it is not
+  // ahead of the current stream position, treat it as a reconnect.
   if (posToken && !connectionState) {
     if (sincePos <= currentStreamPos) {
       // Valid position, create fresh connection state treating it as a reconnect
@@ -1468,11 +1448,10 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Track whether there are any actual changes to report
   let hasChanges = isInitialSync; // Initial sync always has "changes"
 
-  // Don't update connection state position yet - only if we have changes
   connectionState.lastAccess = Date.now();
 
   const response: SlidingSyncResponse = {
-    pos: posToken || String(currentStreamPos), // Start with input pos, update later if changes
+    pos: posToken || String(currentStreamPos), // overwritten below once the response is built
     lists: {},
     rooms: {},
     extensions: {},
@@ -1579,7 +1558,6 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         const firstTimeRead = currentNotificationCount === 0
           && !connectionState.roomSentAsRead?.[roomInfo.roomId];
 
-        // Include room if it's initial, has new events, notification count changed, fully_read changed, OR first time read
         if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
           hasChanges = true; // Mark that we have actual changes
           response.rooms[roomInfo.roomId] = roomData;
@@ -1677,17 +1655,13 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       const firstTimeRead = currentNotificationCount === 0
         && !connectionState.roomSentAsRead?.[roomId];
 
-      // For room subscriptions, ALWAYS include room data because client explicitly requested it
-      // This is different from list-based sync - room subscriptions mean "give me this room's data"
-      // Element X needs this when opening a room to display timeline and state
+      // Subscribed rooms are always returned: the client asked for this room by
+      // name, and Element X needs it to render a room the user just opened.
       hasChanges = true;
       response.rooms[roomId] = roomData;
 
-      // Also track for legacy reasons (notification changes, read status)
+      // The room is already in the response; this only refreshes its tracking state.
       if (isInitialRoom || (roomData.timeline && roomData.timeline.length > 0) || notificationCountChanged || fullyReadChanged || firstTimeRead) {
-        // Already included above, but update tracking state
-
-        // Update tracked state
         connectionState.roomNotificationCounts = connectionState.roomNotificationCounts || {};
         connectionState.roomNotificationCounts[roomId] = currentNotificationCount;
         connectionState.roomFullyReadMarkers = connectionState.roomFullyReadMarkers || {};
@@ -1715,9 +1689,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }
   }
 
-  // Handle extensions
-  // Note: Extensions are considered enabled if the key exists OR if enabled=true
-  // Element X sends extensions without explicit enabled:true
+  // An extension counts as enabled when its key is present; Element X sends them
+  // without an explicit enabled:true.
   if (body.extensions) {
     // Log what extensions are requested (consider present = enabled for MSC4186 compatibility)
     const enabledExtensions = Object.keys(body.extensions).filter(k => {
@@ -1726,7 +1699,6 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     });
     console.log('[sliding-sync] Extensions requested:', enabledExtensions);
 
-    // to_device: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.to_device) {
       const deviceId = c.get('deviceId');
       const limit = body.extensions.to_device.limit || 100;
@@ -1747,7 +1719,6 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       };
     }
 
-    // e2ee: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.e2ee) {
       const deviceId = c.get('deviceId');
 
@@ -1783,9 +1754,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       const deviceListChanged: string[] = [];
 
       if (sincePos === 0) {
-        // CRITICAL FIX: On first sync, include user's own ID if they have device keys
-        // This is essential for E2EE bootstrap - Element X needs to see its own user
-        // in device_lists.changed to know cross-signing keys were uploaded successfully
+        // First sync reports the user's own ID so Element X sees that its
+        // cross-signing keys were uploaded and can finish E2EE bootstrap.
         const userKeysDO = c.env.USER_KEYS.get(c.env.USER_KEYS.idFromName(userId));
         const deviceIdsResp = await userKeysDO.fetch(new Request('http://internal/device-keys/list'));
         const deviceIds = await deviceIdsResp.json() as string[];
@@ -1822,7 +1792,6 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       };
     }
 
-    // account_data: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.account_data) {
       // Get global account data from D1
       const globalData = await db.prepare(`
@@ -1840,8 +1809,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         }
       }
 
-      // CRITICAL: Get E2EE account data from Durable Object (strongly consistent)
-      // This ensures SSSS data is immediately visible after being written
+      // E2EE account data comes from the strongly consistent DO, so SSSS data is
+      // visible immediately after it is written.
       const { getE2EEAccountDataFromDO } = await import('./account-data');
       try {
         const e2eeData = await getE2EEAccountDataFromDO(c.env, userId);
@@ -1886,9 +1855,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       }
     }
 
-    // Handle typing extension - uses Room Durable Objects
-    // Element X doesn't always request typing explicitly, so include it for rooms in response
-    // typing: enabled if key exists (MSC4186 compatibility)
+    // Typing comes from the Room DOs. Element X does not always request it, so it
+    // is included whenever the response contains rooms.
     const typingRequested = !!body.extensions.typing;
     const roomsInResponse = Object.keys(response.rooms);
 
@@ -1929,7 +1897,6 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       }
     }
 
-    // receipts: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.receipts) {
       // Fetch receipts for rooms in response, subscriptions, or all user's rooms as fallback
       // This matches the typing extension pattern for Element X compatibility
@@ -1969,17 +1936,14 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       }
     }
 
-    // presence: enabled if key exists (MSC4186) or enabled=true (MSC3575)
     if (body.extensions.presence) {
       response.extensions.presence = { events: [] };
     }
   }
 
-  // Include ephemeral data on INITIAL sync only if extensions weren't requested
-  // Running this on every sync causes spam - clients sync rapidly when they receive data
-  // Element X typically requests extensions properly on incremental syncs
-  // Use initialSyncComplete flag to track if we've already done initial sync for this connection,
-  // since clients can reconnect with sincePos === 0 but we shouldn't spam ephemeral data again
+  // Clients that request no extensions get ephemeral data once, on the first sync
+  // of a connection. initialSyncComplete guards it rather than the position, since
+  // a client can reconnect with pos 0 and should not be sent all of it again.
   const needsEphemeralFallback = !connectionState.initialSyncComplete
     && (!body.extensions || Object.keys(body.extensions).length === 0);
 
@@ -2015,9 +1979,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       };
     }
 
-    // Fallback: Include room account_data (especially m.fully_read for unread counts)
-    // Element X needs m.fully_read to calculate unread counts
-    // IMPORTANT: Also ensure room is in response.rooms so Element X processes the account_data
+    // Fallback room account data, mainly m.fully_read: Element X needs it for unread counts.
     response.extensions.account_data = { global: [], rooms: {} };
     for (const roomId of userRoomIds) {
       const roomAccountData = await db.prepare(`
@@ -2038,9 +2000,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     }
   }
 
-  // Always advance position to prevent client re-sync loops
-  // Previously we only set pos when hasChanges, but this caused clients to receive
-  // the same pos twice and immediately re-sync, thinking it was stale
+  // Always advance pos: repeating a pos reads as stale to the client and sends it
+  // straight back into another sync.
   response.pos = String(currentStreamPos);
   connectionState.pos = currentStreamPos;
 

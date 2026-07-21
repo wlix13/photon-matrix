@@ -104,7 +104,6 @@ export class FederationDurableObject extends DurableObject<Env> {
       edus?: any[];
     };
 
-    // Process incoming PDUs
     const processedPdus: string[] = [];
     for (const pdu of data.pdus || []) {
       // Store the event

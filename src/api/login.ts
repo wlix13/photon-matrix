@@ -62,7 +62,6 @@ app.post('/_matrix/client/v3/login', async (c) => {
       return Errors.missingParam('token').toResponse();
     }
 
-    // Look up the token in KV
     const tokenHash = await hashToken(token);
     const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as {
       user_id: string;
@@ -73,16 +72,14 @@ app.post('/_matrix/client/v3/login', async (c) => {
       return Errors.forbidden('Invalid or expired login token').toResponse();
     }
 
-    // Check expiration
     if (Date.now() > tokenData.expires_at) {
-      // Clean up expired token
       await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
       return Errors.forbidden('Login token has expired').toResponse();
     }
 
     userId = tokenData.user_id;
 
-    // Delete the token (one-time use)
+    // Login tokens are single-use
     await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
 
   } else if (type === 'm.login.password') {
@@ -91,7 +88,6 @@ app.post('/_matrix/client/v3/login', async (c) => {
       return Errors.missingParam('identifier or password').toResponse();
     }
 
-    // Parse identifier
     if (identifier.type === 'm.id.user') {
       // Can be full user ID or just localpart
       if (identifier.user.startsWith('@')) {
@@ -103,13 +99,11 @@ app.post('/_matrix/client/v3/login', async (c) => {
       return Errors.unrecognized('Unknown identifier type').toResponse();
     }
 
-    // Get stored password hash
     const storedHash = await getPasswordHash(c.env.DB, userId);
     if (!storedHash) {
       return Errors.forbidden('Invalid username or password').toResponse();
     }
 
-    // Verify password
     const valid = await verifyPassword(password, storedHash);
     if (!valid) {
       return Errors.forbidden('Invalid username or password').toResponse();
@@ -135,7 +129,6 @@ app.post('/_matrix/client/v3/login', async (c) => {
     return Errors.unrecognized('Unknown login type').toResponse();
   }
 
-  // Check if user is deactivated
   const user = await getUserById(c.env.DB, userId);
   if (!user) {
     return Errors.forbidden('Invalid username or password').toResponse();
@@ -144,24 +137,20 @@ app.post('/_matrix/client/v3/login', async (c) => {
     return Errors.userDeactivated().toResponse();
   }
 
-  // Generate or use provided device ID
   const deviceId = device_id || await generateDeviceId();
 
-  // Create device
   await createDevice(c.env.DB, userId, deviceId, initial_device_display_name);
 
-  // Generate access token
   const accessToken = await generateAccessToken();
   const tokenHash = await hashToken(accessToken);
   const tokenId = await generateOpaqueId(16);
 
   await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
 
-  // Generate refresh token and store in KV with auto-expiration
+  // The refresh token lives in KV so its TTL expires it without a cleanup job
   const refreshToken = await generateRefreshToken();
   const refreshTokenHash = await hashToken(refreshToken);
 
-  // Store refresh token in KV with 7-day TTL
   await c.env.SESSIONS.put(
     `refresh:${refreshTokenHash}`,
     JSON.stringify({
@@ -203,9 +192,8 @@ app.post('/_matrix/client/v3/logout/all', requireAuth(), async (c) => {
   return c.json({});
 });
 
-// POST /_matrix/client/v3/refresh - Refresh access token
-// Uses the refresh token to get a new access token + refresh token pair
-// Implements token rotation (single-use refresh tokens)
+// POST /_matrix/client/v3/refresh - Exchange a refresh token for a new token pair
+// Refresh tokens rotate: each one is single-use
 app.post('/_matrix/client/v3/refresh', async (c) => {
   let body: { refresh_token?: string };
   try {
@@ -220,10 +208,8 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
     return Errors.missingParam('refresh_token').toResponse();
   }
 
-  // Hash the incoming refresh token
   const refreshTokenHash = await hashToken(refreshToken);
 
-  // Look up in KV
   const tokenData = await c.env.SESSIONS.get(`refresh:${refreshTokenHash}`, 'json') as {
     userId: string;
     deviceId: string | null;
@@ -237,26 +223,22 @@ app.post('/_matrix/client/v3/refresh', async (c) => {
 
   const { userId, deviceId, accessTokenId } = tokenData;
 
-  // Delete old refresh token from KV (token rotation - single use)
+  // Rotation: the presented refresh token and the access token it minted are both retired
   await c.env.SESSIONS.delete(`refresh:${refreshTokenHash}`);
 
-  // Delete old access token from D1
   await c.env.DB.prepare(
     `DELETE FROM access_tokens WHERE token_id = ?`
   ).bind(accessTokenId).run();
 
-  // Generate new access token
   const newAccessToken = await generateAccessToken();
   const newTokenHash = await hashToken(newAccessToken);
   const newTokenId = await generateOpaqueId(16);
 
   await createAccessToken(c.env.DB, newTokenId, newTokenHash, userId, deviceId);
 
-  // Generate new refresh token
   const newRefreshToken = await generateRefreshToken();
   const newRefreshTokenHash = await hashToken(newRefreshToken);
 
-  // Store new refresh token in KV with 7-day TTL
   await c.env.SESSIONS.put(
     `refresh:${newRefreshTokenHash}`,
     JSON.stringify({
@@ -316,7 +298,6 @@ app.post('/_matrix/client/v3/register', async (c) => {
     auth,
   } = body;
 
-  // Check registration kind
   const kind = c.req.query('kind') || 'user';
   if (kind !== 'user' && kind !== 'guest') {
     return Errors.invalidParam('kind', 'Invalid registration kind').toResponse();
@@ -326,9 +307,8 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   // For non-guests, require username and password
   if (!isGuest) {
-    // Simple auth - in production, implement UIA (User-Interactive Authentication)
+    // Registration UIA is a single m.login.dummy stage
     if (!auth || auth.type !== 'm.login.dummy') {
-      // Return UIA requirements
       const sessionId = await generateOpaqueId(16);
       return c.json({
         flows: [{ stages: ['m.login.dummy'] }],
@@ -350,11 +330,9 @@ app.post('/_matrix/client/v3/register', async (c) => {
     }
   }
 
-  // Generate localpart for guests
   const localpart = isGuest ? await generateOpaqueId(12) : username;
   const userId = formatUserId(localpart, c.env.SERVER_NAME);
 
-  // Check if user already exists
   const existing = await getUserById(c.env.DB, userId);
   if (existing) {
     return Errors.userInUse().toResponse();
@@ -363,10 +341,8 @@ app.post('/_matrix/client/v3/register', async (c) => {
   // Hash password (null for guests)
   const passwordHash = password ? await hashPassword(password) : null;
 
-  // Create user
   await createUser(c.env.DB, userId, localpart, passwordHash, isGuest);
 
-  // Response depends on inhibit_login
   if (inhibit_login) {
     return c.json({
       user_id: userId,
@@ -384,11 +360,10 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   await createAccessToken(c.env.DB, tokenId, tokenHash, userId, deviceId);
 
-  // Generate refresh token and store in KV with auto-expiration
+  // The refresh token lives in KV so its TTL expires it without a cleanup job
   const refreshToken = await generateRefreshToken();
   const refreshTokenHash = await hashToken(refreshToken);
 
-  // Store refresh token in KV with 7-day TTL
   await c.env.SESSIONS.put(
     `refresh:${refreshTokenHash}`,
     JSON.stringify({
@@ -413,12 +388,10 @@ app.post('/_matrix/client/v3/register', async (c) => {
   });
 });
 
-// POST /_matrix/client/v1/login/get_token - Generate a login token for authenticated user
-// Per Matrix spec: generates a short-lived login token for QR code login and similar flows
+// POST /_matrix/client/v1/login/get_token - Short-lived login token for QR code login
 app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
   const userId = c.get('userId');
 
-  // Generate a login token
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
   const loginToken = btoa(String.fromCharCode(...tokenBytes))
     .replace(/\+/g, '-')
@@ -429,7 +402,6 @@ app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
   const expiresInMs = 2 * 60 * 1000;
   const expiresAt = Date.now() + expiresInMs;
 
-  // Store the token in KV with TTL
   const tokenHash = await hashToken(loginToken);
   await c.env.SESSIONS.put(
     `login_token:${tokenHash}`,

@@ -77,8 +77,7 @@ function validateStateEvent(event: any, index: number): StateEventValidation {
   return { valid: true };
 }
 
-// Helper to create initial room events
-// Returns the create event ID for use in initializing m.fully_read
+// Creates the initial state events of a new room and returns the create event ID.
 async function createInitialRoomEvents(
   db: D1Database,
   serverName: string,
@@ -208,8 +207,7 @@ async function createInitialRoomEvents(
     }
   }
 
-  // Process invites with individual error handling (best-effort invites)
-  // If one invite fails, we continue with the rest - the room is still valid
+  // Invites are best-effort: one failure still leaves a usable room.
   if (options.invite) {
     const failedInvites: string[] = [];
     for (const invitee of options.invite) {
@@ -230,7 +228,6 @@ async function createInitialRoomEvents(
     }
   }
 
-  // Return the create event ID for m.fully_read initialization
   return createEventId;
 }
 
@@ -256,7 +253,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     is_direct,
     visibility,
   } = body;
-  // Note: invite_3pid and creation_content are reserved for future use
+  // invite_3pid and creation_content are reserved for future use.
   void body.invite_3pid;
   void body.creation_content;
 
@@ -329,8 +326,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     });
     console.log('[createRoom] Initial room events created successfully');
 
-    // Initialize m.fully_read marker for the room creator
-    // This ensures the room doesn't show all messages as unread
+    // Seed m.fully_read so the creator's new room doesn't start out fully unread.
     await c.env.DB.prepare(`
       INSERT INTO account_data (user_id, room_id, event_type, content)
       VALUES (?, ?, 'm.fully_read', ?)
@@ -339,8 +335,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     console.log('[createRoom] Initialized m.fully_read marker for creator');
   } catch (err) {
     console.error('[createRoom] Failed to create initial room events:', err);
-    // Still return success since room was created, but log the error
-    // In production, we should probably roll back or return an error
+    // The room row exists, so the request succeeds even though its state is incomplete.
   }
 
   // Create room alias if provided
@@ -399,16 +394,14 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
       },
     });
 
-    // Wait for the workflow to complete (with timeout)
-    // The workflow handles retries internally
+    // The workflow handles retries internally.
     try {
       const status = await instance.status();
       console.log('[rooms] Workflow status', { roomId, status });
 
       // If workflow is still running, return accepted
       if (status.status === 'running' || status.status === 'queued') {
-        // Return success - the join is in progress
-        // Client will see the room appear in sync when complete
+        // Join is in progress; the room will appear in sync when it completes.
         return c.json({ room_id: roomId });
       }
 
@@ -427,7 +420,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     }
   }
 
-  // Local room handling (existing code)
+  // Local room handling
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
   }
@@ -855,7 +848,6 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
 
   const members = await getRoomMembers(c.env.DB, roomId);
 
-  // Get full member events - OPTIMIZED: fetch in parallel instead of sequential
   const events = await Promise.all(
     members.map(member =>
       getStateEvent(c.env.DB, roomId, 'm.room.member', member.userId)
@@ -913,15 +905,13 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     unsigned: e.unsigned,
   }));
 
-  // Build response - omit 'end' if no events returned (reached start/end of timeline)
-  // This prevents infinite retry loops when client paginates past available events
-  // Use 's' prefix for consistency with sliding-sync prev_batch tokens
+  // Omitting 'end' at the edge of the timeline stops clients from paginating in
+  // a loop; the 's' prefix matches sliding-sync prev_batch tokens.
   const response: { start: string; end?: string; chunk: typeof clientEvents } = {
     start: from || 's0',
     chunk: clientEvents,
   };
 
-  // Only include 'end' if we have events to paginate from
   if (events.length > 0) {
     response.end = `s${end}`;
   }
@@ -1454,9 +1444,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
 });
 
 // GET /_matrix/client/v3/rooms/:roomId/context/:eventId - Get context around an event
-// NOTE: This endpoint is used by Element X NSE (Notification Service Extension) to fetch
-// event content for rich push notifications. If you see this endpoint being called
-// shortly after a push notification is sent, that's the NSE working correctly.
+// Element X's Notification Service Extension calls this for rich push content.
 app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -1464,8 +1452,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
   const userAgent = c.req.header('User-Agent');
 
-  // NSE Detection logging - /context is a key endpoint for push notification content
-  // NSE typically requests small limit (1-5) for single event context
+  // A small limit means single-event context, the NSE's usual request shape.
   const isLikelyNSE = limit <= 5;
   console.log('[rooms/context] Request:', {
     userId,
@@ -1733,7 +1720,7 @@ app.put('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c)
 
 // DELETE /_matrix/client/v3/directory/room/:roomAlias
 app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async (c) => {
-  // Note: userId could be used for permission checks in future
+  // Any authenticated user may delete an alias; there is no permission check yet.
   void c.get('userId');
   const alias = decodeURIComponent(c.req.param('roomAlias'));
 
@@ -1746,11 +1733,7 @@ app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async 
   return c.json({});
 });
 
-// ============================================
-// Room Summary (MSC3266)
-// ============================================
-
-// GET /_matrix/client/v1/room_summary/:roomIdOrAlias - Get a summary of a room
+// GET /_matrix/client/v1/room_summary/:roomIdOrAlias - Get a summary of a room (MSC3266)
 // Allows previewing a room without joining it (if permitted by room settings)
 app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
   const roomIdOrAlias = decodeURIComponent(c.req.param('roomIdOrAlias'));
@@ -1860,10 +1843,9 @@ app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
     }
   }
 
-  // Check if room summary is allowed based on join rules
-  // For non-public rooms, only show summary if user is a member or if world_readable
+  // A private room's summary is only exposed to members or when world-readable;
+  // otherwise answer 404 rather than confirm the room exists.
   if (!room.is_public && !worldReadable && !response.membership) {
-    // Don't reveal room existence for private rooms to non-members
     if (!['public', 'knock', 'knock_restricted'].includes(joinRule)) {
       return Errors.notFound('Room not found').toResponse();
     }
@@ -1872,11 +1854,7 @@ app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
   return c.json(response);
 });
 
-// ============================================
-// Timestamp to Event (MSC3030)
-// ============================================
-
-// GET /_matrix/client/v3/rooms/:roomId/timestamp_to_event
+// GET /_matrix/client/v3/rooms/:roomId/timestamp_to_event (MSC3030)
 // Finds the closest event to a given timestamp
 app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -1948,10 +1926,6 @@ app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), as
   });
 });
 
-// ============================================
-// Room Upgrade
-// ============================================
-
 // Supported room versions
 const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
 
@@ -1993,8 +1967,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Check user has permission to send m.room.tombstone events
-  // User needs power level >= events['m.room.tombstone'] (default 100 for state events)
+  // Upgrading requires the power level needed to send m.room.tombstone.
   const powerLevelsEvent = await getStateEvent(db, oldRoomId, 'm.room.power_levels', '');
   const powerLevels = powerLevelsEvent ? JSON.parse(typeof powerLevelsEvent.content === 'string' ? powerLevelsEvent.content : JSON.stringify(powerLevelsEvent.content)) : null;
 
@@ -2150,7 +2123,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     await createNewRoomEvent('m.room.guest_access', content, '');
   }
 
-  // Now send tombstone to old room
+  // Send the tombstone to the old room
   const oldRoomState = await getRoomState(db, oldRoomId);
   const oldPrevEvent = await db.prepare(`
     SELECT event_id, depth FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1
@@ -2180,8 +2153,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
 
   await storeEvent(db, tombstoneEvent);
 
-  // Update old room's power levels to restrict posting
-  // Elevate events_default to prevent casual messaging
+  // Raise the old room's power levels so it can no longer be posted in.
   const newPowerLevels = powerLevels ? { ...powerLevels } : {
     users: { [userId]: 100 },
     users_default: 0,

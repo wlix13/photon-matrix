@@ -18,7 +18,6 @@ import {
   getMembership,
 } from '../services/database';
 
-// Parameters passed when triggering the workflow
 export interface JoinParams {
   roomId: string;
   userId: string;

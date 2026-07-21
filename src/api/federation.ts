@@ -118,7 +118,6 @@ app.get('/_matrix/key/v2/server', async (c) => {
     old_verify_keys: {},
   };
 
-  // Sign the response with the secure key
   const currentKey = keys.results.find((k) => k.key_version === 2 && k.private_key_jwk);
   if (currentKey && currentKey.private_key_jwk) {
     const signed = await signJson(
@@ -158,7 +157,7 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
   return c.json(response);
 });
 
-// Helper function to get our server's notary signing key
+// This server's current notary signing key, or null if none is configured.
 async function getNotarySigningKey(db: D1Database): Promise<{
   keyId: string;
   privateKeyJwk: JsonWebKey;
@@ -177,25 +176,19 @@ async function getNotarySigningKey(db: D1Database): Promise<{
   };
 }
 
-// Helper function to validate server name
+// Whether a server name is a hostname[:port] we can safely send requests to.
 function isValidServerName(serverName: string): boolean {
-  // Basic server name validation
-  // Server names should be hostname:port or just hostname
-  // Must not contain SSRF-vulnerable patterns
-
-  // Check for empty or too long
   if (!serverName || serverName.length > 255) {
     return false;
   }
 
-  // Check using URL validation (construct a fake URL to validate the hostname)
+  // validateUrl only takes URLs, so wrap the name in one to reuse its SSRF checks
   const testUrl = `https://${serverName}/`;
   const validation = validateUrl(testUrl);
 
   return validation.valid;
 }
 
-// Maximum number of servers in a batch query
 const MAX_BATCH_SERVERS = 100;
 
 // POST /_matrix/key/v2/query - Batch query for server keys (notary endpoint)
@@ -215,7 +208,6 @@ app.post('/_matrix/key/v2/query', async (c) => {
     return Errors.missingParam('server_keys').toResponse();
   }
 
-  // Check batch size limit
   const serverCount = Object.keys(serverKeys).length;
   if (serverCount > MAX_BATCH_SERVERS) {
     return c.json(
@@ -227,7 +219,6 @@ app.post('/_matrix/key/v2/query', async (c) => {
     );
   }
 
-  // Get our notary signing key
   const notaryKey = await getNotarySigningKey(c.env.DB);
   if (!notaryKey) {
     return c.json(
@@ -241,7 +232,6 @@ app.post('/_matrix/key/v2/query', async (c) => {
 
   const results: ServerKeyResponse[] = [];
 
-  // Process each server in the request
   for (const [serverName, keyRequests] of Object.entries(serverKeys)) {
     // Validate server name to prevent SSRF
     if (!isValidServerName(serverName)) {
@@ -249,7 +239,6 @@ app.post('/_matrix/key/v2/query', async (c) => {
       continue;
     }
 
-    // If querying our own server, return our keys directly
     if (serverName === c.env.SERVER_NAME) {
       const ownKeys = await c.env.DB.prepare(
         `SELECT key_id, public_key, valid_until FROM server_keys WHERE is_current = 1`
@@ -273,7 +262,6 @@ app.post('/_matrix/key/v2/query', async (c) => {
           old_verify_keys: {},
         };
 
-        // Sign with our own key
         const signed = (await signJson(
           ownResponse,
           c.env.SERVER_NAME,
@@ -286,11 +274,9 @@ app.post('/_matrix/key/v2/query', async (c) => {
       continue;
     }
 
-    // Process each key request for this server
     for (const [keyId, keyRequest] of Object.entries(keyRequests)) {
       const minimumValidUntilTs = keyRequest.minimum_valid_until_ts || 0;
 
-      // Fetch keys with notary signature
       const keyResponses = await getRemoteKeysWithNotarySignature(
         serverName,
         keyId === '' ? null : keyId, // Empty key ID means all keys
@@ -325,7 +311,6 @@ app.get('/_matrix/key/v2/query/:serverName', async (c) => {
     );
   }
 
-  // Get our notary signing key
   const notaryKey = await getNotarySigningKey(c.env.DB);
   if (!notaryKey) {
     return c.json(
@@ -337,7 +322,6 @@ app.get('/_matrix/key/v2/query/:serverName', async (c) => {
     );
   }
 
-  // If querying our own server, return our keys directly
   if (serverName === c.env.SERVER_NAME) {
     const ownKeys = await c.env.DB.prepare(
       `SELECT key_id, public_key, valid_until FROM server_keys WHERE is_current = 1`
@@ -364,7 +348,6 @@ app.get('/_matrix/key/v2/query/:serverName', async (c) => {
       old_verify_keys: {},
     };
 
-    // Sign with our own key
     const signed = (await signJson(
       ownResponse,
       c.env.SERVER_NAME,
@@ -375,7 +358,6 @@ app.get('/_matrix/key/v2/query/:serverName', async (c) => {
     return c.json({ server_keys: [signed] });
   }
 
-  // Fetch keys from remote server with notary signature
   const keyResponses = await getRemoteKeysWithNotarySignature(
     serverName,
     null, // All keys
@@ -411,7 +393,6 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
     );
   }
 
-  // Get our notary signing key
   const notaryKey = await getNotarySigningKey(c.env.DB);
   if (!notaryKey) {
     return c.json(
@@ -423,7 +404,6 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
     );
   }
 
-  // If querying our own server, return the specific key
   if (serverName === c.env.SERVER_NAME) {
     const ownKey = await c.env.DB.prepare(
       `SELECT key_id, public_key, valid_until FROM server_keys WHERE key_id = ?`
@@ -442,7 +422,6 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
       old_verify_keys: {},
     };
 
-    // Sign with our own key
     const signed = (await signJson(
       ownResponse,
       c.env.SERVER_NAME,
@@ -453,7 +432,6 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
     return c.json({ server_keys: [signed] });
   }
 
-  // Fetch specific key from remote server with notary signature
   const keyResponses = await getRemoteKeysWithNotarySignature(
     serverName,
     keyId,
@@ -473,23 +451,19 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
 });
 
 // PUT /_matrix/federation/v1/send/:txnId - Receive events from remote server
-// This endpoint is now protected by requireFederationAuth middleware
 app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   const txnId = c.req.param('txnId');
 
-  // Origin is now authenticated via the federation auth middleware
   const origin = c.get('federationOrigin' as any) as string | undefined;
   if (!origin) {
     return Errors.unauthorized('Federation authentication required').toResponse();
   }
 
-  // Check for duplicate transaction (idempotency)
   const existingTxn = await c.env.DB.prepare(
     `SELECT response FROM federation_transactions WHERE origin = ? AND txn_id = ?`
   ).bind(origin, txnId).first<{ response: string | null }>();
 
   if (existingTxn?.response) {
-    // Return cached response for duplicate transaction
     return c.json(JSON.parse(existingTxn.response));
   }
 
@@ -579,7 +553,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Verify content hash if present
       if (pdu.hashes?.sha256) {
         try {
           const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
@@ -704,7 +677,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         error: e.message || 'Unknown error',
       };
 
-      // Record rejection
       if (pdu?.event_id && pdu?.room_id) {
         const pduOrigin = (pdu.sender as string)?.split(':')[1] || origin;
         await c.env.DB.prepare(
@@ -723,12 +695,10 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
       switch (eduType) {
         case 'm.typing':
-          // Handle typing notification
-          // In a full implementation, this would notify connected clients
+          // Inbound typing notifications are not applied yet
           break;
 
         case 'm.presence': {
-          // Process inbound presence EDUs from federated servers
           const presencePush = content?.push as Array<{
             user_id: string;
             presence: string;
@@ -769,7 +739,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
 
         case 'm.device_list_update': {
-          // Process inbound device list update EDUs from federated servers
           const deviceUserId = content?.user_id as string;
           const deviceId = content?.device_id as string;
           const streamId = (content?.stream_id as number) || 0;
@@ -802,7 +771,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                 ).run();
               }
 
-              // Update stream tracking
               await c.env.DB.prepare(`
                 INSERT INTO remote_device_list_streams (user_id, stream_id, updated_at)
                 VALUES (?, ?, ?)
@@ -984,7 +952,6 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
   const eventId = c.req.query('event_id');
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -993,13 +960,11 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Get state event IDs
   let stateEventIds: string[];
   let authChainIds: string[];
 
   if (eventId) {
-    // Get state at a specific event
-    // For now, we get current state - proper implementation would track state snapshots
+    // State snapshots are not tracked, so this falls back to current state
     const stateEvents = await c.env.DB.prepare(
       `SELECT e.event_id, e.auth_events
        FROM room_state rs
@@ -1009,7 +974,6 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
 
     stateEventIds = stateEvents.results.map(e => e.event_id);
 
-    // Collect auth chain IDs
     const authChainSet = new Set<string>();
     for (const event of stateEvents.results) {
       const authEvents = JSON.parse(event.auth_events) as string[];
@@ -1019,7 +983,6 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
     }
     authChainIds = Array.from(authChainSet);
   } else {
-    // Get current state
     const stateEvents = await c.env.DB.prepare(
       `SELECT e.event_id, e.auth_events
        FROM room_state rs
@@ -1029,7 +992,6 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
 
     stateEventIds = stateEvents.results.map(e => e.event_id);
 
-    // Collect auth chain IDs
     const authChainSet = new Set<string>();
     for (const event of stateEvents.results) {
       const authEvents = JSON.parse(event.auth_events) as string[];
@@ -1051,7 +1013,6 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
   const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -1060,7 +1021,6 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Get the event
   const event = await c.env.DB.prepare(
     `SELECT event_id, auth_events FROM events WHERE event_id = ? AND room_id = ?`
   ).bind(eventId, roomId).first<{ event_id: string; auth_events: string }>();
@@ -1135,7 +1095,6 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '100', 10), 1000);
   const vParam = c.req.query('v'); // Starting event IDs
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -1144,12 +1103,11 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Parse starting event IDs
   const startEventIds = vParam ? vParam.split(',') : [];
 
   let events: any[];
   if (startEventIds.length > 0) {
-    // Get events before the specified events
+    // Walk back from the shallowest of the requested events
     const startEvents = await c.env.DB.prepare(
       `SELECT MIN(depth) as min_depth FROM events WHERE event_id IN (${startEventIds.map(() => '?').join(',')})`
     ).bind(...startEventIds).first<{ min_depth: number }>();
@@ -1165,7 +1123,6 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
        LIMIT ?`
     ).bind(roomId, maxDepth, limit).all()).results;
   } else {
-    // Get most recent events
     events = (await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
        origin_server_ts, depth, auth_events, prev_events, hashes, signatures
@@ -1220,7 +1177,6 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   const limit = Math.min(body.limit || 10, 100);
   const minDepth = body.min_depth || 0;
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -1275,7 +1231,6 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
         signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
       });
 
-      // Add prev_events to process
       const prevEvents = JSON.parse(event.prev_events) as string[];
       for (const prevId of prevEvents) {
         if (!visited.has(prevId)) {
@@ -1290,12 +1245,11 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   });
 });
 
-// POST /_matrix/federation/v1/make_join/:roomId/:userId - Prepare join request
+// GET /_matrix/federation/v1/make_join/:roomId/:userId - Prepare join request
 app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   const roomId = c.req.param('roomId');
   const userId = c.req.param('userId');
 
-  // Check if room exists and is joinable
   const room = await c.env.DB.prepare(
     `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string; room_version: string }>();
@@ -1304,7 +1258,7 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Get current room state for auth events
+  // Auth events the joining server must reference
   const createEvent = await c.env.DB.prepare(
     `SELECT e.event_id FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
@@ -1553,7 +1507,6 @@ app.get('/_matrix/federation/v1/make_leave/:roomId/:userId', async (c) => {
   const roomId = c.req.param('roomId');
   const userId = c.req.param('userId');
 
-  // Check if room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string; room_version: string }>();
@@ -1562,7 +1515,6 @@ app.get('/_matrix/federation/v1/make_leave/:roomId/:userId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Check if user is a member of the room
   const membership = await c.env.DB.prepare(
     `SELECT e.event_id FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
@@ -1635,7 +1587,6 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  // Validate the event is a leave event
   if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
@@ -1643,7 +1594,6 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate the event ID matches
   if (body.event_id && body.event_id !== eventId) {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
@@ -1651,7 +1601,6 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -1676,7 +1625,6 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  // Validate the event is a leave event
   if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
@@ -1684,7 +1632,6 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate the event ID matches
   if (body.event_id && body.event_id !== eventId) {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
@@ -1692,7 +1639,6 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Verify room exists
   const room = await c.env.DB.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -1726,7 +1672,6 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
 
   const inviteEvent = body.event || body;
 
-  // Validate the event is an invite
   if (inviteEvent.type !== 'm.room.member' || inviteEvent.content?.membership !== 'invite') {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event is not an invite event' },
@@ -1734,7 +1679,6 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate event ID matches
   if (inviteEvent.event_id && inviteEvent.event_id !== eventId) {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
@@ -1742,7 +1686,6 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate the invite is for a local user
   const stateKey = inviteEvent.state_key;
   if (!stateKey || !stateKey.includes(':')) {
     return c.json(
@@ -1759,7 +1702,6 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Check if user exists locally
   const localUser = await c.env.DB.prepare(
     `SELECT user_id FROM users WHERE user_id = ?`
   ).bind(stateKey).first<{ user_id: string }>();
@@ -1771,8 +1713,6 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Sign the invite event and return it
-  // Get our signing key
   const key = await c.env.DB.prepare(
     `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 2`
   ).first<{ key_id: string; private_key_jwk: string | null }>();
@@ -1825,7 +1765,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     return Errors.missingParam('event').toResponse();
   }
 
-  // Check room version is supported
   if (!SUPPORTED_ROOM_VERSIONS.includes(roomVersion)) {
     return c.json(
       { errcode: 'M_INCOMPATIBLE_ROOM_VERSION', error: `Unsupported room version: ${roomVersion}` },
@@ -1833,7 +1772,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate the event is an invite
   if (inviteEvent.type !== 'm.room.member' || inviteEvent.content?.membership !== 'invite') {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event is not an invite event' },
@@ -1841,7 +1779,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate event ID matches
   if (inviteEvent.event_id && inviteEvent.event_id !== eventId) {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
@@ -1849,7 +1786,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Validate the invite is for a local user
   const stateKey = inviteEvent.state_key;
   if (!stateKey || !stateKey.includes(':')) {
     return c.json(
@@ -1866,7 +1802,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Check if user exists locally
   const localUser = await c.env.DB.prepare(
     `SELECT user_id FROM users WHERE user_id = ?`
   ).bind(stateKey).first<{ user_id: string }>();
@@ -1878,7 +1813,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     );
   }
 
-  // Sign the invite event and return it
   const key = await c.env.DB.prepare(
     `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 2`
   ).first<{ key_id: string; private_key_jwk: string | null }>();
@@ -1898,7 +1832,6 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     JSON.parse(key.private_key_jwk)
   );
 
-  // v2 returns { event: signedEvent }
   return c.json({ event: signedEvent });
 });
 
@@ -1953,18 +1886,15 @@ app.get('/_matrix/federation/v1/query/profile', async (c) => {
   });
 });
 
-// ============================================
-// Federation E2EE Endpoints
-// Required for cross-server encrypted messaging
-// ============================================
+// Federation E2EE endpoints for cross-server encrypted messaging
 
-// Helper to get UserKeys Durable Object for a user
+// The UserKeys Durable Object stub for a user
 function getUserKeysDO(env: typeof app extends Hono<infer E> ? E['Bindings'] : never, userId: string): DurableObjectStub {
   const id = env.USER_KEYS.idFromName(userId);
   return env.USER_KEYS.get(id);
 }
 
-// Helper to get device keys from Durable Object
+// Device keys for a user, or for one device, from the UserKeys DO
 async function getDeviceKeysFromDO(env: typeof app extends Hono<infer E> ? E['Bindings'] : never, userId: string, deviceId?: string): Promise<any> {
   const stub = getUserKeysDO(env, userId);
   const url = deviceId
@@ -1977,7 +1907,7 @@ async function getDeviceKeysFromDO(env: typeof app extends Hono<infer E> ? E['Bi
   return await response.json();
 }
 
-// Helper to get cross-signing keys from Durable Object
+// Cross-signing keys for a user from the UserKeys DO
 async function getCrossSigningKeysFromDO(env: typeof app extends Hono<infer E> ? E['Bindings'] : never, userId: string): Promise<{
   master?: any;
   self_signing?: any;
@@ -2016,7 +1946,7 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
   const masterKeys: Record<string, any> = {};
   const selfSigningKeys: Record<string, any> = {};
 
-  // Helper to merge signatures from D1 into device keys
+  // Merges cross-signing signatures stored in D1 into a device key
   async function mergeSignaturesForDevice(userId: string, deviceId: string, deviceKey: any): Promise<any> {
     const dbSignatures = await db.prepare(`
       SELECT signer_user_id, signer_key_id, signature
@@ -2040,14 +1970,12 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
   }
 
   for (const [userId, requestedDevices] of Object.entries(requestedKeys)) {
-    // Verify user is local to this server
     const userServerName = userId.split(':')[1];
     if (userServerName !== serverName) {
       // Skip non-local users - federation should query their home server
       continue;
     }
 
-    // Check if user exists locally
     const user = await db.prepare(
       `SELECT user_id FROM users WHERE user_id = ?`
     ).bind(userId).first<{ user_id: string }>();
@@ -2060,7 +1988,6 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
 
     // Get device keys from Durable Object (strongly consistent)
     if (!requestedDevices || requestedDevices.length === 0) {
-      // Get all devices for this user
       const allDeviceKeys = await getDeviceKeysFromDO(c.env, userId);
       for (const [deviceId, keys] of Object.entries(allDeviceKeys)) {
         if (keys) {
@@ -2068,7 +1995,6 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
         }
       }
     } else {
-      // Get specific devices
       for (const deviceId of requestedDevices) {
         const keys = await getDeviceKeysFromDO(c.env, userId, deviceId);
         if (keys) {
@@ -2077,8 +2003,7 @@ app.post('/_matrix/federation/v1/user/keys/query', async (c) => {
       }
     }
 
-    // Get cross-signing keys (master + self_signing only for federation)
-    // Note: user_signing key is NOT included in federation responses per spec
+    // Federation carries master + self_signing only; user_signing stays private per spec.
     const csKeys = await getCrossSigningKeysFromDO(c.env, userId);
 
     if (csKeys.master) {
@@ -2120,7 +2045,6 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
   const oneTimeKeys: Record<string, Record<string, Record<string, any>>> = {};
 
   for (const [userId, devices] of Object.entries(requestedKeys)) {
-    // Verify user is local to this server
     const userServerName = userId.split(':')[1];
     if (userServerName !== serverName) {
       continue;
@@ -2138,20 +2062,16 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
       let foundKey = false;
 
       if (existingKeys && existingKeys[algorithm]) {
-        // Find first unclaimed key
         const keyIndex = existingKeys[algorithm].findIndex(k => !k.claimed);
         if (keyIndex >= 0) {
           const key = existingKeys[algorithm][keyIndex];
-          // Mark as claimed
           existingKeys[algorithm][keyIndex].claimed = true;
 
-          // Save back to KV
           await c.env.ONE_TIME_KEYS.put(
             `otk:${userId}:${deviceId}`,
             JSON.stringify(existingKeys)
           );
 
-          // Also mark in D1
           await db.prepare(`
             UPDATE one_time_keys SET claimed = 1, claimed_at = ?
             WHERE user_id = ? AND device_id = ? AND key_id = ?
@@ -2177,7 +2097,6 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
         }>();
 
         if (otk) {
-          // Mark as claimed
           await db.prepare(`
             UPDATE one_time_keys SET claimed = 1, claimed_at = ? WHERE id = ?
           `).bind(Date.now(), otk.id).run();
@@ -2201,7 +2120,6 @@ app.post('/_matrix/federation/v1/user/keys/claim', async (c) => {
         }>();
 
         if (fallback) {
-          // Mark fallback as used
           await db.prepare(`
             UPDATE fallback_keys SET used = 1 WHERE user_id = ? AND device_id = ? AND algorithm = ?
           `).bind(userId, deviceId, algorithm).run();
@@ -2230,7 +2148,6 @@ app.get('/_matrix/federation/v1/user/devices/:userId', async (c) => {
   const userId = c.req.param('userId');
   const db = c.env.DB;
 
-  // Verify user is local to this server
   const userServerName = userId.split(':')[1];
   if (userServerName !== serverName) {
     return c.json({
@@ -2239,7 +2156,6 @@ app.get('/_matrix/federation/v1/user/devices/:userId', async (c) => {
     }, 403);
   }
 
-  // Check if user exists
   const user = await db.prepare(
     `SELECT user_id FROM users WHERE user_id = ?`
   ).bind(userId).first<{ user_id: string }>();
@@ -2256,12 +2172,10 @@ app.get('/_matrix/federation/v1/user/devices/:userId', async (c) => {
   // Get device keys from Durable Object (strongly consistent)
   const allDeviceKeys = await getDeviceKeysFromDO(c.env, userId);
 
-  // Get stream_id for device key changes
   const streamPosition = await db.prepare(
     `SELECT MAX(stream_position) as stream_id FROM device_key_changes WHERE user_id = ?`
   ).bind(userId).first<{ stream_id: number | null }>();
 
-  // Build device list
   const devices: Array<{
     device_id: string;
     keys?: any;
@@ -2286,7 +2200,6 @@ app.get('/_matrix/federation/v1/user/devices/:userId', async (c) => {
     devices,
   };
 
-  // Add cross-signing keys if present
   if (csKeys.master) {
     response.master_key = csKeys.master;
   }
@@ -2297,10 +2210,7 @@ app.get('/_matrix/federation/v1/user/devices/:userId', async (c) => {
   return c.json(response);
 });
 
-// ============================================
-// Knock Protocol Endpoints
-// Allows users to request to join rooms
-// ============================================
+// Knock protocol endpoints - users request to join a room
 
 // GET /_matrix/federation/v1/make_knock/:roomId/:userId - Prepare knock request
 // Remote servers call this to get a knock event template
@@ -2309,7 +2219,6 @@ app.get('/_matrix/federation/v1/make_knock/:roomId/:userId', async (c) => {
   const userId = c.req.param('userId');
   const db = c.env.DB;
 
-  // Check if room exists
   const room = await db.prepare(
     `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string; room_version: string }>();
@@ -2341,7 +2250,6 @@ app.get('/_matrix/federation/v1/make_knock/:roomId/:userId', async (c) => {
     }, 403);
   }
 
-  // Check if user is already banned
   const membership = await db.prepare(
     `SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`
   ).bind(roomId, userId).first<{ membership: string }>();
@@ -2427,7 +2335,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  // Validate the event is a knock event
   if (body.type !== 'm.room.member' || body.content?.membership !== 'knock') {
     return c.json({
       errcode: 'M_INVALID_PARAM',
@@ -2435,7 +2342,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     }, 400);
   }
 
-  // Validate the event ID matches
   if (body.event_id && body.event_id !== eventId) {
     return c.json({
       errcode: 'M_INVALID_PARAM',
@@ -2443,7 +2349,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     }, 400);
   }
 
-  // Verify room exists
   const room = await db.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -2494,7 +2399,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     }, 403);
   }
 
-  // Store the knock event
   try {
     await db.prepare(`
       INSERT OR IGNORE INTO events
@@ -2515,13 +2419,11 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
       body.signatures ? JSON.stringify(body.signatures) : null
     ).run();
 
-    // Update room state
     await db.prepare(`
       INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
       VALUES (?, ?, ?, ?)
     `).bind(roomId, body.type, body.state_key, eventId).run();
 
-    // Update memberships table
     await db.prepare(`
       INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id)
       VALUES (?, ?, 'knock', ?)
@@ -2533,7 +2435,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
   // Return stripped state events (room name, avatar, join_rules, canonical_alias)
   const strippedState: any[] = [];
 
-  // Get room name
   const nameEvent = await db.prepare(`
     SELECT e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts
     FROM room_state rs
@@ -2556,7 +2457,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     });
   }
 
-  // Get room avatar
   const avatarEvent = await db.prepare(`
     SELECT e.event_type, e.state_key, e.content, e.sender
     FROM room_state rs
@@ -2578,7 +2478,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     });
   }
 
-  // Get join_rules
   if (joinRulesEvent) {
     const joinRulesEventFull = await db.prepare(`
       SELECT e.event_type, e.state_key, e.content, e.sender
@@ -2602,7 +2501,6 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
     }
   }
 
-  // Get canonical alias
   const aliasEvent = await db.prepare(`
     SELECT e.event_type, e.state_key, e.content, e.sender
     FROM room_state rs
@@ -2666,7 +2564,6 @@ app.get('/_matrix/federation/v1/media/thumbnail/:mediaId', async (c) => {
   const height = Math.min(parseInt(c.req.query('height') || '96'), 1920);
   const method = c.req.query('method') || 'scale';
 
-  // Get media metadata
   const metadata = await c.env.DB.prepare(
     `SELECT content_type FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string }>();
@@ -2677,7 +2574,6 @@ app.get('/_matrix/federation/v1/media/thumbnail/:mediaId', async (c) => {
 
   const isImage = metadata.content_type.startsWith('image/');
 
-  // Check for pre-generated thumbnail
   const thumbnailKey = `thumb_${mediaId}_${width}x${height}_${method}`;
   const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
@@ -2716,7 +2612,7 @@ app.get('/_matrix/federation/v1/publicRooms', async (c) => {
 
   const limit = Math.min(parseInt(c.req.query('limit') || '100'), 500);
   const since = c.req.query('since');
-  // Note: include_all_networks reserved for future use
+  // include_all_networks is not implemented
   void c.req.query('include_all_networks');
 
   // Parse since token for pagination (format: "offset_N")
@@ -2725,7 +2621,6 @@ app.get('/_matrix/federation/v1/publicRooms', async (c) => {
     offset = parseInt(since.substring(7), 10) || 0;
   }
 
-  // Query public rooms
   const rooms = await db.prepare(`
     SELECT r.room_id
     FROM rooms r
@@ -2737,7 +2632,6 @@ app.get('/_matrix/federation/v1/publicRooms', async (c) => {
   const hasMore = rooms.results.length > limit;
   const roomResults = rooms.results.slice(0, limit);
 
-  // Build room chunks
   const chunks: any[] = [];
 
   for (const room of roomResults) {
@@ -2747,7 +2641,6 @@ app.get('/_matrix/federation/v1/publicRooms', async (c) => {
     }
   }
 
-  // Count total
   const totalCount = await db.prepare(`
     SELECT COUNT(*) as count FROM rooms WHERE is_public = 1
   `).first<{ count: number }>();
@@ -2789,13 +2682,11 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
   const since = body.since;
   const searchTerm = body.filter?.generic_search_term?.toLowerCase();
 
-  // Parse since token
   let offset = 0;
   if (since && since.startsWith('offset_')) {
     offset = parseInt(since.substring(7), 10) || 0;
   }
 
-  // Query public rooms with optional search
   let rooms;
   if (searchTerm) {
     rooms = await db.prepare(`
@@ -2828,7 +2719,6 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
   const hasMore = rooms.results.length > limit;
   const roomResults = rooms.results.slice(0, limit);
 
-  // Build room chunks
   const chunks: any[] = [];
 
   for (const room of roomResults) {
@@ -2838,7 +2728,6 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
     }
   }
 
-  // Count total
   const totalCount = await db.prepare(`
     SELECT COUNT(*) as count FROM rooms WHERE is_public = 1
   `).first<{ count: number }>();
@@ -2858,63 +2747,54 @@ app.post('/_matrix/federation/v1/publicRooms', async (c) => {
   return c.json(response);
 });
 
-// Helper to get public room info
+// Builds a public rooms directory entry for a room
 async function getRoomPublicInfo(db: D1Database, roomId: string, _serverName: string): Promise<any> {
-  // Get room name
   const nameEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.name'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get room topic
   const topicEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.topic'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get canonical alias
   const aliasEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.canonical_alias'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get avatar
   const avatarEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.avatar'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get join rule
   const joinRuleEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.join_rules'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get history visibility
   const historyEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.history_visibility'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get guest access
   const guestEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.room.guest_access'
   `).bind(roomId).first<{ content: string }>();
 
-  // Get member count
   const memberCount = await db.prepare(`
     SELECT COUNT(*) as count FROM room_memberships WHERE room_id = ? AND membership = 'join'
   `).bind(roomId).first<{ count: number }>();
 
-  // Get room type
   const createEvent = await db.prepare(`
     SELECT e.content FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
@@ -2957,9 +2837,7 @@ async function getRoomPublicInfo(db: D1Database, roomId: string, _serverName: st
   };
 }
 
-// ============================================
-// Federation Space Hierarchy
-// ============================================
+// Federation space hierarchy
 
 // GET /_matrix/federation/v1/hierarchy/:roomId - Get space hierarchy
 app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
@@ -2971,7 +2849,6 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
   const from = c.req.query('from');
 
-  // Check if room exists
   const room = await db.prepare(`
     SELECT room_id FROM rooms WHERE room_id = ?
   `).bind(roomId).first();
@@ -2980,7 +2857,6 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Parse pagination token
   let offset = 0;
   if (from && from.startsWith('offset_')) {
     offset = parseInt(from.substring(7), 10) || 0;
@@ -3028,14 +2904,12 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
     }
   }
 
-  // Process each child
   for (const child of childResults) {
     const childRoomId = child.state_key;
 
     try {
       const content = JSON.parse(child.content);
 
-      // Skip if suggested_only and not suggested
       if (suggestedOnly && !content.suggested) {
         continue;
       }
@@ -3045,7 +2919,6 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
         continue;
       }
 
-      // Get child room info
       const childInfo = await getRoomPublicInfo(db, childRoomId, serverName);
       if (childInfo) {
         rooms.push({
@@ -3071,9 +2944,7 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
   return c.json(response);
 });
 
-// ============================================
-// Miscellaneous Federation Endpoints
-// ============================================
+// Miscellaneous federation endpoints
 
 // GET /_matrix/federation/v1/timestamp_to_event/:roomId - Find event closest to timestamp
 app.get('/_matrix/federation/v1/timestamp_to_event/:roomId', async (c) => {
@@ -3086,7 +2957,6 @@ app.get('/_matrix/federation/v1/timestamp_to_event/:roomId', async (c) => {
     return Errors.missingParam('ts').toResponse();
   }
 
-  // Verify room exists
   const room = await db.prepare(
     `SELECT room_id FROM rooms WHERE room_id = ?`
   ).bind(roomId).first<{ room_id: string }>();
@@ -3134,7 +3004,6 @@ app.get('/_matrix/federation/v1/openid/userinfo', async (c) => {
     return Errors.missingParam('access_token').toResponse();
   }
 
-  // Look up the OpenID token in KV
   const tokenData = await c.env.SESSIONS.get(`openid:${accessToken}`, 'json') as {
     user_id: string;
     expires_at: number;
@@ -3147,9 +3016,7 @@ app.get('/_matrix/federation/v1/openid/userinfo', async (c) => {
     }, 401);
   }
 
-  // Check if token has expired
   if (Date.now() > tokenData.expires_at) {
-    // Clean up expired token
     await c.env.SESSIONS.delete(`openid:${accessToken}`);
     return c.json({
       errcode: 'M_UNKNOWN_TOKEN',
@@ -3199,7 +3066,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     return Errors.badJson().toResponse();
   }
 
-  // Validate this is a membership invite
   if (body.type !== 'm.room.member' || body.content?.membership !== 'invite') {
     return c.json({
       errcode: 'M_INVALID_PARAM',
@@ -3207,7 +3073,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 400);
   }
 
-  // Validate room ID matches
   if (body.room_id !== roomId) {
     return c.json({
       errcode: 'M_INVALID_PARAM',
@@ -3215,7 +3080,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 400);
   }
 
-  // Validate third_party_invite is present
   const thirdPartyInvite = body.content.third_party_invite;
   if (!thirdPartyInvite || !thirdPartyInvite.signed) {
     return c.json({
@@ -3232,7 +3096,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 400);
   }
 
-  // Verify room exists
   const room = await db.prepare(`
     SELECT room_id, room_version FROM rooms WHERE room_id = ?
   `).bind(roomId).first<{ room_id: string; room_version: string }>();
@@ -3278,9 +3141,8 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 400);
   }
 
-  // Verify the signature against the public keys in the invite
-  // The signed object format is: { mxid, sender, token, signatures }
-  // where sender is from the original third_party_invite event
+  // The signed object is { mxid, sender, token, signatures }, where sender comes
+  // from the original third_party_invite event rather than the request body.
   const signedDataForVerification: Record<string, unknown> = {
     mxid,
     sender: thirdPartyInviteEvent.sender,
@@ -3294,19 +3156,16 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     publicKeys.push({ public_key: inviteContent.public_key });
   }
 
-  // Try to verify with each public key
   for (const keyInfo of publicKeys) {
     const publicKey = keyInfo.public_key;
     if (!publicKey) continue;
 
-    // Look for a signature from the identity server
-    // Signatures are keyed by server name (typically the identity server)
+    // Signatures are keyed by server name, typically the identity server
     for (const [signingServer, keySignatures] of Object.entries(signatures)) {
       for (const [keyId, signature] of Object.entries(keySignatures)) {
         if (!signature) continue;
 
         try {
-          // Verify the Ed25519 signature using the public key from the invite
           const isValid = await verifySignature(
             signedDataForVerification,
             signingServer,
@@ -3334,7 +3193,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 403);
   }
 
-  // Verify the mxid matches the state_key
   if (mxid !== body.state_key) {
     return c.json({
       errcode: 'M_INVALID_PARAM',
@@ -3342,7 +3200,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     }, 400);
   }
 
-  // Get our signing key
   const key = await db.prepare(
     `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 2`
   ).first<{ key_id: string; private_key_jwk: string | null }>();
@@ -3395,7 +3252,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
   const depth = (latestEvent?.depth || 0) + 1;
   const originServerTs = Date.now();
 
-  // Create the invite event
   const inviteEvent = {
     room_id: roomId,
     sender: body.sender,
@@ -3414,15 +3270,14 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     prev_events: prevEvents,
   };
 
-  // Calculate event ID (for room versions 1-3, event_id is computed differently)
-  // For room versions 4+, event_id is computed from the content hash
+  // With no event_id in the request, fall back to a local hash of the event -
+  // this is not the room-version reference hash.
   const eventIdHash = await sha256(JSON.stringify({
     ...inviteEvent,
     origin: serverName,
   }));
   const eventId = body.event_id || `$${eventIdHash}`;
 
-  // Sign the event
   const signedEvent = await signJson(
     { ...inviteEvent, event_id: eventId },
     serverName,
@@ -3430,7 +3285,6 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
     JSON.parse(key.private_key_jwk)
   );
 
-  // Store the event
   try {
     await db.prepare(`
       INSERT OR IGNORE INTO events
@@ -3450,13 +3304,11 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
       JSON.stringify((signedEvent as any).signatures)
     ).run();
 
-    // Update room state
     await db.prepare(`
       INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id)
       VALUES (?, 'm.room.member', ?, ?)
     `).bind(roomId, mxid, eventId).run();
 
-    // Update memberships table
     await db.prepare(`
       INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id, display_name)
       VALUES (?, ?, 'invite', ?, ?)

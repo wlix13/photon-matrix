@@ -1,6 +1,4 @@
-// Federation Key Management Service
-// Handles fetching, caching, and validating remote server signing keys
-// Includes notary support for key query endpoints
+// Fetching, caching, validating and notary-signing remote server signing keys
 
 import { verifySignature, signJson, base64UrlDecode } from '../utils/crypto';
 import { discoverServer, buildServerUrl } from './server-discovery';
@@ -107,7 +105,6 @@ async function fetchKeysFromRemote(
   serverName: string,
   cache?: KVNamespace
 ): Promise<RemoteServerKey[]> {
-  // Use the new server discovery service
   const discovery = await discoverServer(serverName, cache);
   const serverUrl = buildServerUrl(discovery);
 
@@ -243,8 +240,7 @@ export async function fetchRawServerKeyResponse(
 }
 
 /**
- * Get remote server keys with notary signature
- * Fetches keys from remote server, verifies them, and adds our notary signature
+ * Fetch a remote server's keys, verify them, and add our notary signature
  */
 export async function getRemoteKeysWithNotarySignature(
   serverName: string,
@@ -262,7 +258,6 @@ export async function getRemoteKeysWithNotarySignature(
 
   if (cached) {
     const cachedResponses: ServerKeyResponse[] = JSON.parse(cached);
-    // Check if cached keys meet validity requirement
     const validCached = cachedResponses.filter(
       (r) => r.valid_until_ts >= minimumValidUntilTs
     );
@@ -450,19 +445,10 @@ export async function getServerSigningKey(db: D1Database): Promise<SigningKey | 
 }
 
 /**
- * Build the X-Matrix authorization header for outgoing federation requests
+ * Build the X-Matrix authorization header for outgoing federation requests.
  *
- * Per Matrix spec, the Authorization header format is:
- * X-Matrix origin=<origin>,destination=<destination>,key=<key_id>,sig=<signature>
- *
- * The signature is computed over a JSON object containing:
- * {
- *   "method": "GET" or "POST" etc,
- *   "uri": "/path/to/endpoint",
- *   "origin": "sending.server.name",
- *   "destination": "receiving.server.name",
- *   "content": { ... } // Only for POST/PUT requests with body
- * }
+ * The signature covers {method, uri, origin, destination, content?}; the header
+ * is X-Matrix origin=<origin>,destination=<destination>,key=<id>,sig=<signature>.
  */
 export async function signFederationRequest(
   method: string,
@@ -472,7 +458,6 @@ export async function signFederationRequest(
   signingKey: SigningKey,
   content?: unknown
 ): Promise<string> {
-  // Build the request object to sign
   const requestObj: Record<string, unknown> = {
     method,
     uri,
@@ -485,7 +470,6 @@ export async function signFederationRequest(
     requestObj.content = content;
   }
 
-  // Sign the request object
   const signed = await signJson(
     requestObj,
     origin,
@@ -493,15 +477,12 @@ export async function signFederationRequest(
     signingKey.privateKeyJwk
   );
 
-  // Extract the signature
   const signature = (signed.signatures as Record<string, Record<string, string>>)?.[origin]?.[signingKey.keyId];
 
   if (!signature) {
     throw new Error('Failed to sign federation request');
   }
 
-  // Build the Authorization header
-  // Format: X-Matrix origin="sending.server",destination="receiving.server",key="ed25519:abc",sig="base64sig"
   return `X-Matrix origin="${origin}",destination="${destination}",key="${signingKey.keyId}",sig="${signature}"`;
 }
 
@@ -524,7 +505,6 @@ export async function makeFederationRequest(
   // Build the full URI (path only, not full URL)
   const uri = path;
 
-  // Sign the request
   const authHeader = await signFederationRequest(
     method,
     uri,
@@ -534,7 +514,6 @@ export async function makeFederationRequest(
     body
   );
 
-  // Make the request
   const options: RequestInit = {
     method,
     headers: {

@@ -72,7 +72,6 @@ export class SyncDurableObject extends DurableObject<Env> {
       }
     }
 
-    // Wait for events endpoint (for long-polling)
     if (path === '/wait-for-events') {
       return this.handleWaitForEvents(request);
     }
@@ -216,7 +215,6 @@ export class SyncDurableObject extends DurableObject<Env> {
       }
     }
 
-    // Wake up all waiting long-polling requests
     const numResolvers = this.waitingResolvers.length;
     const resolvers = this.waitingResolvers;
     this.waitingResolvers = [];
@@ -230,7 +228,7 @@ export class SyncDurableObject extends DurableObject<Env> {
     return new Response('OK');
   }
 
-  // Wait for events (used by long-polling sliding sync)
+  // Fallback long-poll wait: parks the request until a wake arrives or it times out.
   private async handleWaitForEvents(request: Request): Promise<Response> {
     try {
       const body = await request.json() as { timeout?: number };

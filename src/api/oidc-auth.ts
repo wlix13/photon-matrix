@@ -1,5 +1,4 @@
-// OIDC Authentication API endpoints
-// Handles OAuth flow for external Identity Providers
+// OAuth login flow against external OIDC identity providers.
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
@@ -51,9 +50,8 @@ interface OAuthState {
   returnTo?: string;
 }
 
-// Version byte for encrypted secrets
-// 0x01 = legacy (SERVER_NAME-based key) - INSECURE, kept for migration
-// 0x02 = secure (OIDC_ENCRYPTION_KEY)
+// Version byte prefixed to every encrypted secret: 0x01 is the weak SERVER_NAME-derived
+// key, kept only to decrypt older secrets; 0x02 uses OIDC_ENCRYPTION_KEY.
 const ENCRYPTION_VERSION_LEGACY = 0x01;
 const ENCRYPTION_VERSION_SECURE = 0x02;
 
@@ -73,7 +71,7 @@ async function getEncryptionKey(
     return crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
   }
 
-  // Legacy key derivation (INSECURE - only for decrypting old secrets)
+  // Legacy key derivation - weak, kept only for decrypting old secrets
   console.warn('Using legacy OIDC encryption - please set OIDC_ENCRYPTION_KEY');
   return crypto.subtle.importKey(
     'raw',
@@ -84,15 +82,13 @@ async function getEncryptionKey(
   );
 }
 
-// Encrypt a secret using AES-GCM
-// Uses OIDC_ENCRYPTION_KEY if available, otherwise falls back to SERVER_NAME (legacy)
+// Encrypt a secret with AES-GCM under OIDC_ENCRYPTION_KEY, or the legacy key if unset
 async function encryptSecret(
   secret: string,
   env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string }
 ): Promise<string> {
   const encoder = new TextEncoder();
 
-  // Determine which version to use
   const version = env.OIDC_ENCRYPTION_KEY ? ENCRYPTION_VERSION_SECURE : ENCRYPTION_VERSION_LEGACY;
   const keyMaterial = await getEncryptionKey(env, version);
 
@@ -109,8 +105,7 @@ async function encryptSecret(
   return btoa(String.fromCharCode(...combined));
 }
 
-// Decrypt a secret
-// Automatically detects version and uses appropriate key
+// Decrypt a secret, picking the key from its version byte
 async function decryptSecret(
   encryptedSecret: string,
   env: { SERVER_NAME: string; OIDC_ENCRYPTION_KEY?: string }
@@ -168,7 +163,6 @@ app.get('/auth/oidc/:providerId/login', async (c) => {
   const returnTo = c.req.query('return_to') || '/';
   const db = c.env.DB;
 
-  // Get provider config
   const provider = await db.prepare(`
     SELECT * FROM idp_providers WHERE id = ? AND enabled = 1
   `).bind(providerId).first<IdPProvider>();
@@ -178,14 +172,11 @@ app.get('/auth/oidc/:providerId/login', async (c) => {
   }
 
   try {
-    // Fetch OIDC discovery
     const discovery = await fetchOIDCDiscovery(provider.issuer_url);
 
-    // Generate state and nonce
     const state = generateRandomString(32);
     const nonce = generateRandomString(32);
 
-    // Build redirect URI
     const host = c.req.header('host') || c.env.SERVER_NAME;
     const protocol = c.req.url.startsWith('https') ? 'https' : 'https';
     const redirectUri = `${protocol}://${host}/auth/oidc/${providerId}/callback`;
@@ -201,7 +192,6 @@ app.get('/auth/oidc/:providerId/login', async (c) => {
       expirationTtl: 600,
     });
 
-    // Build authorization URL and redirect
     const authUrl = buildAuthorizationUrl(
       discovery,
       provider.client_id,
@@ -244,15 +234,12 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
 
   const stateData: OAuthState = JSON.parse(stateDataJson);
 
-  // Delete state (one-time use)
   await c.env.SESSIONS.delete(`oidc_state:${state}`);
 
-  // Validate provider matches
   if (stateData.providerId !== providerId) {
     return c.html(generateErrorPage('Invalid State', 'Provider mismatch'));
   }
 
-  // Get provider config
   const provider = await db.prepare(`
     SELECT * FROM idp_providers WHERE id = ? AND enabled = 1
   `).bind(providerId).first<IdPProvider>();
@@ -262,14 +249,11 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
   }
 
   try {
-    // Fetch OIDC discovery and JWKS
     const discovery = await fetchOIDCDiscovery(provider.issuer_url);
     const jwks = await fetchJWKS(discovery.jwks_uri);
 
-    // Decrypt client secret
     const clientSecret = await decryptSecret(provider.client_secret_encrypted, c.env);
 
-    // Exchange code for tokens
     const tokens = await exchangeCodeForTokens(
       discovery,
       provider.client_id,
@@ -278,7 +262,6 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
       stateData.redirectUri
     );
 
-    // Validate ID token and extract claims
     const claims = await validateIDToken(
       tokens.id_token,
       provider.issuer_url,
@@ -287,7 +270,6 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
       jwks
     );
 
-    // Check if user link exists
     let userLink = await db.prepare(`
       SELECT * FROM idp_user_links WHERE provider_id = ? AND external_id = ?
     `).bind(providerId, claims.sub).first<IdPUserLink>();
@@ -310,15 +292,12 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
         ));
       }
 
-      // Derive username from claims
       const username = deriveUsername(claims, provider.username_claim);
       userId = formatUserId(username, c.env.SERVER_NAME);
 
-      // Check if Matrix user already exists
       const existingUser = await getUserById(db, userId);
       if (existingUser) {
-        // User exists but not linked - check if we should auto-link or error
-        // For now, auto-link if the user exists
+        // A Matrix account with this username already exists - link it to this identity
         await db.prepare(`
           INSERT INTO idp_user_links (provider_id, external_id, user_id, external_email, external_name, last_login_at)
           VALUES (?, ?, ?, ?, ?, ?)
@@ -327,14 +306,12 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
         // Create new Matrix user
         await createUser(db, userId, username, null, false);
 
-        // Set display name if available
         if (claims.name) {
           await db.prepare(`
             UPDATE users SET display_name = ? WHERE user_id = ?
           `).bind(claims.name, userId).run();
         }
 
-        // Create user link
         await db.prepare(`
           INSERT INTO idp_user_links (provider_id, external_id, user_id, external_email, external_name, last_login_at)
           VALUES (?, ?, ?, ?, ?, ?)
@@ -342,7 +319,7 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
       }
     }
 
-    // Generate Matrix access token
+    // Issue Matrix credentials for the linked account
     const deviceId = await generateDeviceId();
     await createDevice(db, userId, deviceId, `SSO Login (${provider.name})`);
 
@@ -351,7 +328,6 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
     const tokenId = await generateOpaqueId(16);
     await createAccessToken(db, tokenId, tokenHash, userId, deviceId);
 
-    // Return success page with token (or redirect)
     return c.html(generateSuccessPage(userId, accessToken, deviceId, c.env.SERVER_NAME, stateData.returnTo));
 
   } catch (err) {
@@ -441,16 +417,14 @@ Device ID: ${deviceId}\`;
 </html>`;
 }
 
-// GET /_matrix/client/v1/auth_metadata - Get authentication metadata
-// Returns information about supported authentication methods (MSC2965 / Matrix v1.17)
-// This is the STABLE endpoint as of Matrix v1.17
+// GET /_matrix/client/v1/auth_metadata - Supported authentication methods
+// Stable MSC2965 endpoint as of Matrix v1.17
 app.get('/_matrix/client/v1/auth_metadata', async (c) => {
   const serverName = c.env.SERVER_NAME;
   const baseUrl = `https://${serverName}`;
 
-  // Return proper OIDC metadata for this server acting as its own OIDC provider
-  // This is required for Element Web OIDC-native authentication to work
-  // All fields must be present for Element Web to accept the configuration
+  // This server acts as its own OIDC provider, and Element Web only accepts the
+  // configuration when every field below is present.
   const response = {
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
@@ -491,10 +465,6 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
   return c.json(response);
 });
 
-// ============================================
-// MSC3861 Identity Reset Endpoint
-// ============================================
-
 // Helper to get next stream position (same pattern as keys.ts)
 async function getNextStreamPosition(db: D1Database, streamName: string): Promise<number> {
   await db.prepare(`
@@ -515,11 +485,8 @@ function getUserKeysDO(env: any, userId: string) {
 }
 
 // POST /_matrix/client/unstable/org.matrix.msc3861/account/identity/reset
-// Allows OIDC users to reset their cross-signing identity
-// Per MSC3861:
-// 1. Requires OIDC re-authentication (valid access token)
-// 2. Deletes all cross-signing keys for the user
-// 3. Returns 200 on success
+// MSC3861: drops the user's cross-signing identity so it can be re-created. A valid
+// access token is the required OIDC re-authentication.
 app.post('/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const db = c.env.DB;
@@ -535,7 +502,6 @@ app.post('/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset', r
     // Delete cross-signing keys from D1 (backup storage)
     await db.prepare('DELETE FROM cross_signing_keys WHERE user_id = ?').bind(userId).run();
 
-    // Delete cross-signing signatures
     await db.prepare('DELETE FROM cross_signing_signatures WHERE user_id = ? OR signer_user_id = ?').bind(userId, userId).run();
 
     // Delete from KV (cache)
@@ -550,7 +516,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset', r
 
     console.log(`[OIDC] Cross-signing identity reset for user ${userId}`);
 
-    // Return empty object on success per MSC3861
+    // Empty object on success per MSC3861
     return c.json({});
   } catch (err) {
     console.error(`[OIDC] Identity reset failed for ${userId}:`, err);

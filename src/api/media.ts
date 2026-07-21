@@ -9,10 +9,9 @@ import { validateUrlForPreview } from '../utils/url-validator';
 
 const app = new Hono<AppEnv>();
 
-// Maximum upload size (50MB)
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
-// Supported MIME types (used for validation in future)
+// Supported MIME types (not currently enforced on upload).
 export const SUPPORTED_TYPES = [
   'image/jpeg',
   'image/png',
@@ -35,24 +34,19 @@ export const SUPPORTED_TYPES = [
 app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   const userId = c.get('userId');
 
-  // Get content type and filename
   const contentType = c.req.header('Content-Type') || 'application/octet-stream';
   const filename = c.req.query('filename');
 
-  // Check content length
   const contentLength = parseInt(c.req.header('Content-Length') || '0');
   if (contentLength > MAX_UPLOAD_SIZE) {
     return Errors.tooLarge('File exceeds maximum upload size').toResponse();
   }
 
-  // Generate media ID
   const mediaId = await generateOpaqueId(24);
   const mxcUri = `mxc://${c.env.SERVER_NAME}/${mediaId}`;
 
-  // Get the raw body
   const body = await c.req.arrayBuffer();
 
-  // Store in R2
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: {
       contentType,
@@ -64,7 +58,6 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
     },
   });
 
-  // Store metadata in D1
   await c.env.DB.prepare(
     `INSERT INTO media (media_id, user_id, content_type, content_length, filename, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
@@ -85,13 +78,11 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
     return Errors.notFound('Remote media not supported').toResponse();
   }
 
-  // Get from R2
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // Get metadata
   const metadata = await c.env.DB.prepare(
     `SELECT content_type, filename FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
@@ -117,13 +108,11 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
     return Errors.notFound('Remote media not supported').toResponse();
   }
 
-  // Get from R2
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // Get metadata
   const metadata = await c.env.DB.prepare(
     `SELECT content_type FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string }>();
@@ -149,7 +138,6 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return Errors.notFound('Remote media not supported').toResponse();
   }
 
-  // Get media metadata
   const metadata = await c.env.DB.prepare(
     `SELECT content_type FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ content_type: string }>();
@@ -158,10 +146,8 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // Only generate thumbnails for images
   const isImage = metadata.content_type.startsWith('image/');
 
-  // Check if pre-generated thumbnail exists
   const thumbnailKey = `thumb_${mediaId}_${width}x${height}_${method}`;
   const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
@@ -172,13 +158,11 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return new Response(existingThumb.body, { headers });
   }
 
-  // Get original
   const object = await c.env.MEDIA.get(mediaId);
   if (!object) {
     return Errors.notFound('Media not found').toResponse();
   }
 
-  // If not an image, return original
   if (!isImage) {
     const headers = new Headers();
     headers.set('Content-Type', metadata.content_type);
@@ -186,7 +170,6 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return new Response(object.body, { headers });
   }
 
-  // Use Cloudflare Image Resizing via cf.image on fetch
   try {
     const downloadUrl = `https://${c.env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
     const resized = await fetch(downloadUrl, {
@@ -202,7 +185,6 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     });
 
     if (resized.ok) {
-      // Cache the thumbnail in R2 for future requests
       const thumbBody = await resized.arrayBuffer();
       await c.env.MEDIA.put(thumbnailKey, thumbBody, {
         httpMetadata: { contentType: 'image/jpeg' },
@@ -215,11 +197,10 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
       return new Response(thumbBody, { headers });
     }
   } catch (resizeErr) {
-    // Image Resizing may not be available on Free plan - fall back to original
+    // Image Resizing may be unavailable (Free plan); fall back to the original.
     console.warn('[media] Image resize failed (may require Pro plan):', resizeErr);
   }
 
-  // Fallback: return original
   const headers = new Headers();
   headers.set('Content-Type', metadata.content_type);
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
@@ -231,7 +212,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
 // GET /_matrix/media/v3/preview_url - Get URL preview
 app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
   const url = c.req.query('url');
-  // Note: ts is optional timestamp for cache busting, not currently used
+  // ts is an optional cache-busting timestamp; unused here.
   void c.req.query('ts');
 
   if (!url) {
@@ -251,17 +232,14 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
   }
 
   try {
-    // Use the sanitized URL
     const parsedUrl = new URL(validation.sanitizedUrl!);
 
-    // Check cache first
     const cacheKey = `preview:${url}`;
     const cached = await c.env.CACHE.get(cacheKey);
     if (cached) {
       return c.json(JSON.parse(cached));
     }
 
-    // Fetch the URL with timeout
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
@@ -282,26 +260,23 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
 
     const contentType = response.headers.get('Content-Type') || '';
 
-    // Handle images directly
     if (contentType.startsWith('image/')) {
       const result = {
         'og:image': url,
         'og:image:type': contentType,
       };
 
-      // Cache for 1 hour
       await c.env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
       return c.json(result);
     }
 
-    // Only parse HTML content
     if (!contentType.includes('text/html')) {
       return c.json({});
     }
 
     let html: string;
 
-    // Try Browser Rendering for JS-rendered pages (if available)
+    // Browser Rendering, when bound, gets the DOM of JS-rendered pages.
     if (c.env.BROWSER) {
       try {
         const browserResponse = await c.env.BROWSER.fetch(new Request(url, {
@@ -323,26 +298,22 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
     // Extract Open Graph and meta tags
     const preview: Record<string, any> = {};
 
-    // Extract og:title
     const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:title["'][^>]*>/i);
     if (ogTitle) {
       preview['og:title'] = decodeHtmlEntities(ogTitle[1]);
     } else {
-      // Fallback to title tag
       const title = html.match(/<title[^>]*>([^<]*)<\/title>/i);
       if (title) {
         preview['og:title'] = decodeHtmlEntities(title[1]);
       }
     }
 
-    // Extract og:description
     const ogDesc = html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:description["'][^>]*>/i);
     if (ogDesc) {
       preview['og:description'] = decodeHtmlEntities(ogDesc[1]);
     } else {
-      // Fallback to meta description
       const metaDesc = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                       html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*name=["']description["'][^>]*>/i);
       if (metaDesc) {
@@ -350,12 +321,11 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
       }
     }
 
-    // Extract og:image
     const ogImage = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                    html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:image["'][^>]*>/i);
     if (ogImage) {
       let imageUrl = ogImage[1];
-      // Convert relative URLs to absolute
+      // Resolve relative image URLs against the page.
       if (imageUrl.startsWith('/')) {
         imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${imageUrl}`;
       } else if (!imageUrl.startsWith('http')) {
@@ -364,21 +334,18 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
       preview['og:image'] = imageUrl;
     }
 
-    // Extract og:site_name
     const ogSiteName = html.match(/<meta[^>]*property=["']og:site_name["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                       html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:site_name["'][^>]*>/i);
     if (ogSiteName) {
       preview['og:site_name'] = decodeHtmlEntities(ogSiteName[1]);
     }
 
-    // Extract og:type
     const ogType = html.match(/<meta[^>]*property=["']og:type["'][^>]*content=["']([^"']*)["'][^>]*>/i) ||
                   html.match(/<meta[^>]*content=["']([^"']*)["'][^>]*property=["']og:type["'][^>]*>/i);
     if (ogType) {
       preview['og:type'] = ogType[1];
     }
 
-    // Cache for 1 hour
     if (Object.keys(preview).length > 0) {
       await c.env.CACHE.put(cacheKey, JSON.stringify(preview), { expirationTtl: 3600 });
     }
@@ -390,10 +357,8 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
   }
 });
 
-// Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
+// Decode HTML entities exactly once; double-decoding would turn &amp;lt; back into markup.
 function decodeHtmlEntities(text: string): string {
-  // Use a proper HTML entity decoder that handles all entities correctly
-  // and prevents double-decoding by checking if the text is already decoded
   const decoded = text
     .replace(/&amp;/g, '\x00AMP\x00')  // Temporarily replace to prevent double-decode
     .replace(/&lt;/g, '<')
@@ -416,7 +381,6 @@ app.get('/_matrix/media/v3/config', async (c) => {
 
 // ============================================
 // Authenticated Media Endpoints (MSC3916)
-// These are the newer endpoints that clients prefer
 // ============================================
 
 // POST /_matrix/client/v1/media/upload - Authenticated upload
@@ -460,7 +424,6 @@ app.post('/_matrix/client/v1/media/create', requireAuth(), async (c) => {
   const mediaId = await generateOpaqueId(24);
   const mxcUri = `mxc://${c.env.SERVER_NAME}/${mediaId}`;
 
-  // Create a placeholder entry
   await c.env.DB.prepare(
     `INSERT INTO media (media_id, user_id, content_type, content_length, created_at)
      VALUES (?, ?, 'application/octet-stream', 0, ?)`
@@ -482,7 +445,7 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
     return Errors.forbidden('Cannot upload to remote server').toResponse();
   }
 
-  // Check placeholder exists and belongs to user
+  // A placeholder is a row with content_length 0 that the same user created.
   const existing = await c.env.DB.prepare(
     `SELECT user_id, content_length FROM media WHERE media_id = ?`
   ).bind(mediaId).first<{ user_id: string; content_length: number }>();
@@ -662,7 +625,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
 
 // GET /_matrix/client/v1/media/preview_url - Authenticated URL preview
 app.get('/_matrix/client/v1/media/preview_url', requireAuth(), async (c) => {
-  // Delegate to the existing preview_url handler by calling the same logic
+  // Same logic as the v3 preview_url handler, minus Browser Rendering.
   const url = c.req.query('url');
 
   if (!url) {
@@ -682,7 +645,6 @@ app.get('/_matrix/client/v1/media/preview_url', requireAuth(), async (c) => {
   }
 
   try {
-    // Use the sanitized URL
     const parsedUrl = new URL(validation.sanitizedUrl!);
 
     const cacheKey = `preview:${url}`;
