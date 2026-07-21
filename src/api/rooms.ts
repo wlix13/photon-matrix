@@ -1,6 +1,7 @@
 // Matrix room endpoints
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
@@ -958,8 +959,17 @@ app.get('/_matrix/client/v3/rooms/:roomId/state', requireAuth(), async (c) => {
   return c.json(clientEvents);
 });
 
-// GET /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Get specific state
-app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+// Clients address empty-state-key events both bare and with a trailing slash. Hono's `:stateKey?`
+// does not match the trailing-slash form, so all three forms are registered explicitly; an absent
+// `stateKey` param means an empty state key.
+const STATE_EVENT_PATH = '/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey';
+const STATE_EVENT_PATH_NO_KEY = '/_matrix/client/v3/rooms/:roomId/state/:eventType';
+const STATE_EVENT_PATH_EMPTY_KEY = '/_matrix/client/v3/rooms/:roomId/state/:eventType/';
+
+// GET /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey - Get specific state
+// Typed against the fullest path so the params are inferred; stateKey is absent on the
+// other two registrations and falls back to the empty state key.
+async function handleGetStateEvent(c: Context<AppEnv, typeof STATE_EVENT_PATH>) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -977,10 +987,10 @@ app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   }
 
   return c.json(event.content);
-});
+}
 
-// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Set state
-app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+// PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey - Set state
+async function handlePutStateEvent(c: Context<AppEnv, typeof STATE_EVENT_PATH>) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -1051,7 +1061,15 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
 
   return c.json({ event_id: eventId });
-});
+}
+
+app.get(STATE_EVENT_PATH, requireAuth(), handleGetStateEvent);
+app.get(STATE_EVENT_PATH_NO_KEY, requireAuth(), handleGetStateEvent);
+app.get(STATE_EVENT_PATH_EMPTY_KEY, requireAuth(), handleGetStateEvent);
+
+app.put(STATE_EVENT_PATH, requireAuth(), handlePutStateEvent);
+app.put(STATE_EVENT_PATH_NO_KEY, requireAuth(), handlePutStateEvent);
+app.put(STATE_EVENT_PATH_EMPTY_KEY, requireAuth(), handlePutStateEvent);
 
 // GET /_matrix/client/v3/rooms/:roomId/members - Get room members
 app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => {
