@@ -2,10 +2,15 @@
 
 import { createMiddleware } from 'hono/factory';
 import type { AppEnv } from '../types';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { hashToken } from '../utils/crypto';
 import { getUserByTokenHash } from '../services/database';
-import { getAppServiceByToken } from '../services/appservice';
+import {
+  getAppServiceByToken,
+  isUserInExclusiveNamespace,
+  type AppServiceRegistration,
+} from '../services/appservice';
+import { formatUserId, isLocalServerName, parseUserId } from '../utils/ids';
 
 export type AuthContext = {
   userId: string;
@@ -53,6 +58,34 @@ export async function validateAccessToken(
   };
 }
 
+// An app service may only assert the identity of its own sender user or of a
+// local user inside its exclusive namespace.
+function checkMasquerade(
+  appservice: AppServiceRegistration,
+  requestedUserId: string,
+  senderUserId: string,
+  serverName: string
+): MatrixApiError | null {
+  if (requestedUserId === senderUserId) {
+    return null;
+  }
+
+  const parsed = parseUserId(requestedUserId);
+  if (!parsed) {
+    return Errors.invalidParam('user_id', 'Malformed user ID');
+  }
+
+  if (!isLocalServerName(parsed.serverName, serverName)) {
+    return Errors.forbidden('Application service cannot masquerade as a user of another server');
+  }
+
+  if (!isUserInExclusiveNamespace(appservice, requestedUserId)) {
+    return Errors.exclusive('Application service cannot masquerade as this user');
+  }
+
+  return null;
+}
+
 // Middleware that requires authentication
 export function requireAuth() {
   return createMiddleware<AppEnv>(async (c, next) => {
@@ -74,22 +107,32 @@ export function requireAuth() {
 
     // If normal token validation fails, try app service token
     if (!auth) {
+      let appservice: AppServiceRegistration | null = null;
       try {
-        const appservice = await getAppServiceByToken(c.env.DB, token);
-        if (appservice) {
-          // AS can act as its sender user or as a user specified by user_id query param
-          const url = new URL(c.req.url);
-          const asUserId = url.searchParams.get('user_id');
-          const serverName = c.env.SERVER_NAME;
-          const senderUserId = asUserId || `@${appservice.sender_localpart}:${serverName}`;
-          auth = {
-            userId: senderUserId,
-            deviceId: null,
-            accessToken: token,
-          };
-        }
+        appservice = await getAppServiceByToken(c.env.DB, token);
       } catch (asErr) {
         // Ignore AS token lookup errors
+      }
+
+      if (appservice) {
+        // AS acts as its sender user unless it asserts another identity via user_id
+        const serverName = c.env.SERVER_NAME;
+        const senderUserId = formatUserId(appservice.sender_localpart, serverName);
+        const asUserId = new URL(c.req.url).searchParams.get('user_id');
+
+        if (asUserId) {
+          const error = checkMasquerade(appservice, asUserId, senderUserId, serverName);
+          if (error) {
+            console.log(`[AUTH] AS ${appservice.id} denied masquerade as ${asUserId}: ${error.errcode}`);
+            return error.toResponse();
+          }
+        }
+
+        auth = {
+          userId: asUserId || senderUserId,
+          deviceId: null,
+          accessToken: token,
+        };
       }
     }
 

@@ -104,6 +104,10 @@ export const Errors = {
     return new MatrixApiError(ErrorCodes.M_GUEST_ACCESS_FORBIDDEN, message, 403);
   },
 
+  exclusive(message: string = 'ID is outside of the application service namespace'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.M_EXCLUSIVE, message, 403);
+  },
+
   missingParam(param: string): MatrixApiError {
     return new MatrixApiError(ErrorCodes.M_MISSING_PARAM, `Missing required parameter: ${param}`, 400);
   },

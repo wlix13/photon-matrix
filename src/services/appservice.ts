@@ -73,6 +73,19 @@ export async function getAppServiceByToken(db: D1Database, asToken: string): Pro
   };
 }
 
+/**
+ * Match a namespace regex against a value. The pattern must cover the whole
+ * value, otherwise a crafted ID could smuggle a namespace match into a
+ * substring. An unparseable pattern matches nothing.
+ */
+function matchesNamespace(regex: string, value: string): boolean {
+  try {
+    return new RegExp(`^(?:${regex})$`).test(value);
+  } catch {
+    return false;
+  }
+}
+
 /** Check if a user ID matches any exclusive AS namespace */
 export function isExclusiveAppServiceUser(
   appservices: AppServiceRegistration[],
@@ -82,12 +95,20 @@ export function isExclusiveAppServiceUser(
   for (const as of appservices) {
     if (excludeAsId && as.id === excludeAsId) continue;
     for (const ns of as.namespaces.users) {
-      if (ns.exclusive && new RegExp(ns.regex).test(userId)) {
+      if (ns.exclusive && matchesNamespace(ns.regex, userId)) {
         return as;
       }
     }
   }
   return null;
+}
+
+/** Check if a user ID falls inside this AS's own exclusive user namespace */
+export function isUserInExclusiveNamespace(
+  appservice: AppServiceRegistration,
+  userId: string
+): boolean {
+  return isExclusiveAppServiceUser([appservice], userId) !== null;
 }
 
 /** Check if a room alias matches any exclusive AS namespace */
@@ -99,7 +120,7 @@ export function isExclusiveAppServiceAlias(
   for (const as of appservices) {
     if (excludeAsId && as.id === excludeAsId) continue;
     for (const ns of as.namespaces.aliases) {
-      if (ns.exclusive && new RegExp(ns.regex).test(alias)) {
+      if (ns.exclusive && matchesNamespace(ns.regex, alias)) {
         return as;
       }
     }
@@ -119,11 +140,11 @@ export function getInterestedAppServices(
 
     // Check user namespace matches (sender or state_key for membership events)
     for (const ns of as.namespaces.users) {
-      if (new RegExp(ns.regex).test(event.sender)) {
+      if (matchesNamespace(ns.regex, event.sender)) {
         isInterested = true;
         break;
       }
-      if (event.state_key && new RegExp(ns.regex).test(event.state_key)) {
+      if (event.state_key && matchesNamespace(ns.regex, event.state_key)) {
         isInterested = true;
         break;
       }
@@ -132,7 +153,7 @@ export function getInterestedAppServices(
     // Check room namespace matches
     if (!isInterested) {
       for (const ns of as.namespaces.rooms) {
-        if (new RegExp(ns.regex).test(event.room_id)) {
+        if (matchesNamespace(ns.regex, event.room_id)) {
           isInterested = true;
           break;
         }
