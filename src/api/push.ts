@@ -1234,24 +1234,40 @@ export async function sendPushNotification(
           gatewayResponse = {};
         }
 
-        console.log('[push] PUSH_SENT_SUCCESS:', {
-          correlationId,
-          userId,
-          eventId: event.event_id,
-          roomId: event.room_id,
-          appId: pusher.app_id,
-          gatewayResponse,
-          timestamp: new Date().toISOString(),
-          // IMPORTANT: NSE should make a request within ~30 seconds of this timestamp
-          // Look for [sliding-sync] POTENTIAL NSE REQUEST or [rooms/context] Request
-          // with matching roomId and eventId shortly after this log entry
-        });
+        // A pushkey listed in `rejected` is permanently dead: drop the pusher
+        // rather than retrying it on every future notification.
+        const rejected = gatewayResponse?.rejected;
+        if (Array.isArray(rejected) && rejected.includes(pusher.pushkey)) {
+          console.log('[push] PUSH_PUSHKEY_REJECTED:', {
+            correlationId,
+            userId,
+            eventId: event.event_id,
+            appId: pusher.app_id,
+          });
 
-        // Update pusher success
-        await db.prepare(`
-          UPDATE pushers SET last_success = ?, failure_count = 0
-          WHERE user_id = ? AND pushkey = ? AND app_id = ?
-        `).bind(Date.now(), userId, pusher.pushkey, pusher.app_id).run();
+          await db.prepare(`
+            DELETE FROM pushers WHERE user_id = ? AND pushkey = ? AND app_id = ?
+          `).bind(userId, pusher.pushkey, pusher.app_id).run();
+        } else {
+          console.log('[push] PUSH_SENT_SUCCESS:', {
+            correlationId,
+            userId,
+            eventId: event.event_id,
+            roomId: event.room_id,
+            appId: pusher.app_id,
+            gatewayResponse,
+            timestamp: new Date().toISOString(),
+            // NSE should request within ~30s of this timestamp: look for
+            // [sliding-sync] POTENTIAL NSE REQUEST or [rooms/context] Request
+            // with the same roomId and eventId shortly after
+          });
+
+          // Update pusher success
+          await db.prepare(`
+            UPDATE pushers SET last_success = ?, failure_count = 0
+            WHERE user_id = ? AND pushkey = ? AND app_id = ?
+          `).bind(Date.now(), userId, pusher.pushkey, pusher.app_id).run();
+        }
       }
     } catch (error) {
       console.error('[push] PUSH_SEND_ERROR:', {

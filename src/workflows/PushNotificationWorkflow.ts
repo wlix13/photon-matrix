@@ -58,6 +58,9 @@ interface PushRuleResult {
   highlight: boolean;
 }
 
+// Outcome of one push gateway delivery; 'rejected' means the pushkey is permanently invalid
+type PushDeliveryResult = 'delivered' | 'rejected' | 'failed';
+
 export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams> {
   async run(event: WorkflowEvent<PushParams>, step: WorkflowStep): Promise<PushResult> {
     const { eventId, roomId, eventType, sender, content, originServerTs } = event.payload;
@@ -240,13 +243,13 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
         let anySuccess = false;
         for (const pusher of pushers) {
           try {
-            const success = await this.sendToPusher(
+            const delivery = await this.sendToPusher(
               userId,
               pusher,
               eventContext,
               unreadCount
             );
-            if (success) {
+            if (delivery === 'delivered') {
               anySuccess = true;
             }
           } catch (err) {
@@ -354,20 +357,20 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
       roomName: string | undefined;
     },
     unreadCount: number
-  ): Promise<boolean> {
+  ): Promise<PushDeliveryResult> {
     if (pusher.kind !== 'http') {
-      return false;
+      return 'failed';
     }
 
     let pusherData: any;
     try {
       pusherData = JSON.parse(pusher.data);
     } catch {
-      return false;
+      return 'failed';
     }
 
     if (!pusherData.url) {
-      return false;
+      return 'failed';
     }
 
     const senderDisplayName = eventContext.senderDisplayName;
@@ -429,19 +432,38 @@ export class PushNotificationWorkflow extends WorkflowEntrypoint<Env, PushParams
       });
 
       if (response.ok) {
+        // A 2xx body may list pushkeys the gateway will never deliver to again
+        let rejected: unknown;
+        try {
+          rejected = ((await response.json()) as any)?.rejected;
+        } catch {
+          rejected = undefined;
+        }
+
+        if (Array.isArray(rejected) && rejected.includes(pusher.pushkey)) {
+          await this.env.DB.prepare(`
+            DELETE FROM pushers WHERE user_id = ? AND pushkey = ? AND app_id = ?
+          `).bind(userId, pusher.pushkey, pusher.appId).run();
+          console.log('[PushNotificationWorkflow] Pusher rejected, removed', {
+            userId,
+            appId: pusher.appId,
+          });
+          return 'rejected';
+        }
+
         // Update pusher success
         await this.env.DB.prepare(`
           UPDATE pushers SET last_success = ?, failure_count = 0
           WHERE user_id = ? AND pushkey = ? AND app_id = ?
         `).bind(Date.now(), userId, pusher.pushkey, pusher.appId).run();
-        return true;
+        return 'delivered';
       } else {
         // Update pusher failure
         await this.env.DB.prepare(`
           UPDATE pushers SET last_failure = ?, failure_count = failure_count + 1
           WHERE user_id = ? AND pushkey = ? AND app_id = ?
         `).bind(Date.now(), userId, pusher.pushkey, pusher.appId).run();
-        return false;
+        return 'failed';
       }
     } catch (error) {
       // Update pusher failure
