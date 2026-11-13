@@ -1,0 +1,40 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 1,15 * *" # twice a month, closest dependabot gets to every two weeks
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 1,15 * *" # twice a month, closest dependabot gets to every two weeks
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    groups:
+      runtime:
+        dependency-type: "production"
+        patterns:
+          - "*"
+      tooling:
+        dependency-type: "development"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

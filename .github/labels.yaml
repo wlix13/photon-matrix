@@ -1,0 +1,86 @@
+# Core Labels
+- name: "bug"
+  description: "Something is not working"
+  color: "d73a4a"
+
+- name: "feature"
+  description: "New feature or request"
+  color: "a2eeef"
+
+- name: "enhancement"
+  description: "Improvement to existing functionality"
+  color: "0e8a16"
+
+- name: "docs"
+  description: "Documentation updates"
+  color: "0075ca"
+
+- name: "breaking-change"
+  description: "Breaking changes"
+  color: "b60205"
+
+- name: "refactor"
+  description: "Code refactoring"
+  color: "cccccc"
+
+- name: "security"
+  description: "Security-related changes"
+  color: "ee0701"
+
+- name: "ci-cd"
+  description: "CI/CD and automation"
+  color: "0052cc"
+
+- name: "tests"
+  description: "Testing"
+  color: "e99695"
+
+- name: "dependencies"
+  description: "Changes to dependencies"
+  color: "a569bd"
+
+# Matrix-specific labels
+- name: "federation"
+  description: "Matrix federation (inbound/outbound)"
+  color: "1d76db"
+
+- name: "e2ee"
+  description: "End-to-end encryption, keys, backups"
+  color: "fbca04"
+
+- name: "sync"
+  description: "Sync API, sliding sync, rooms"
+  color: "bfd4f2"
+
+- name: "media"
+  description: "Media repository and content"
+  color: "5319e7"
+
+- name: "rooms"
+  description: "Room state, events, durable objects"
+  color: "d4c5f9"
+
+- name: "auth"
+  description: "Authentication, OIDC, and authorization"
+  color: "fbca04"
+
+# PR Labels
+- name: "duplicate"
+  description: "This issue or PR already exists"
+  color: "cfd3d7"
+
+- name: "invalid"
+  description: "This doesn't seem right"
+  color: "e4e669"
+
+- name: "wontfix"
+  description: "This will not be worked on"
+  color: "ffffff"
+
+- name: "javascript"
+  description: "JavaScript/TypeScript dependencies"
+  color: "f1e05a"
+
+- name: "github_actions"
+  description: "GitHub Actions dependencies"
+  color: "2671e5"
